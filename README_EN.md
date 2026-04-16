@@ -5,14 +5,15 @@
 <h1 align="center">Kiro API Proxy</h1>
 
 <p align="center">
-  Kiro IDE API reverse proxy server with multi-account rotation, auto token refresh, and quota management
+  An open-source compatibility and routing layer for developer workflows, with multi-account rotation, token auto-refresh, quota management, and protocol adaptation for OpenAI / Anthropic / Gemini
 </p>
 
 <p align="center">
   <a href="#features">Features</a> •
   <a href="#quick-start">Quick Start</a> •
-  <a href="#cli-configuration">CLI Config</a> •
+  <a href="#cli-configuration">CLI Configuration</a> •
   <a href="#api-endpoints">API</a> •
+  <a href="#project-structure">Project Structure</a> •
   <a href="#license">License</a>
 </p>
 
@@ -22,92 +23,152 @@
 
 ---
 
-> **📢 v1.7.2 Update**
-> 
-> Full multi-language support! The WebUI now supports **English** and **Chinese**. Select your language in the launcher or settings.
+Kiro API Proxy is an open-source compatibility and request routing layer for developer tooling workflows. It is designed to connect Kiro-related capabilities with common LLM client workflows, with a focus on protocol compatibility, authentication management, request routing, quota control, and operational stability in multi-account environments.
+
+It can serve as a unified integration layer for tools such as Claude Code, Codex CLI, and Gemini CLI, making it easier to debug, switch, monitor, and maintain real-world developer workflows.
+
+> **⚠️ Testing Note**
+>
+> This project currently supports **Claude Code**, **Codex CLI**, and **Gemini CLI**, with full tool-calling support.
 
 ## Features
 
 ### Core Features
-- **Multi-Protocol Support** - Compatible with OpenAI / Anthropic / Gemini protocols
-- **Full Tool Calling** - Complete tool calling support for all three protocols
-- **Image Understanding** - Supports Claude Code / Codex CLI image input
-- **Web Search** - Supports Claude Code / Codex CLI web search tools
-- **Multi-Account Rotation** - Add multiple Kiro accounts with automatic load balancing
-- **Session Stickiness** - Same session uses same account for 60 seconds to maintain context
-- **Web UI** - Clean management interface with monitoring, logs, and settings
-- **Multi-Language UI** - Full English and Chinese interface support
+- **Multi-protocol support** - Compatible with OpenAI / Anthropic / Gemini protocols
+- **Full tool-calling support** - Complete tool-calling support across all three protocols
+- **Image understanding** - Supports image input for Claude Code / Codex CLI
+- **Web search** - Supports web search tools for Claude Code / Codex CLI
+- **Multi-account rotation** - Add multiple Kiro accounts with automatic load balancing
+- **Session stickiness** - Reuses the same account within 60 seconds for the same session to preserve context continuity
+- **Web UI** - A clean admin interface with monitoring, logs, and settings
+- **Multilingual interface** - Supports both Chinese and English UI switching
 
-### v1.7.2 New Features
-- **Multi-Language Support** - Complete English WebUI and documentation
-- **Bilingual Launcher** - Port/Language settings with clear Start button
-- **English Help Docs** - All 5 documentation files translated
+### What's New in v1.7.2
+- **Multilingual support** - Full Chinese / English switching in the Web UI
+- **Bilingual launcher** - Port / language settings with clearer launch actions
+- **English documentation** - All 5 built-in docs have been translated into English
 
-### v1.7.1 Features
-- **Windows Support Enhancement** - Registry browser detection + PATH fallback
-- **Packaging Fix** - PyInstaller correctly loads icons and embedded docs
-- **Token Scanning Stability** - Windows path encoding fixes
+### What's New in v1.7.1
+- **Improved Windows support** - Registry browser detection + PATH fallback, including portable browser support
+- **Packaging resource fixes** - Icons and built-in docs now load correctly after PyInstaller packaging
+- **More stable token scanning** - Fixed Windows path encoding issues
 
-### v1.6.x Features
-- **CLI Tools** - Manage accounts on headless servers
-- **Remote Login Link** - Complete auth on browser machine, token syncs automatically
-- **Account Import/Export** - Migrate account configs across machines
-- **Codex CLI Support** - Full OpenAI Responses API (`/v1/responses`)
-- **Rate Limiting** - Reduce account ban risk with request frequency limits
-- **History Management** - 4 strategies to handle conversation length limits
+### What's New in v1.6.3
+- **Command-line interface (CLI)** - Easy management in headless or server environments
+  - `python run.py accounts list` - List accounts
+  - `python run.py accounts export/import` - Export / import accounts
+  - `python run.py accounts add` - Add token interactively
+  - `python run.py accounts scan` - Scan local tokens
+  - `python run.py login google/github` - Log in from the command line
+  - `python run.py login remote` - Generate a remote login link
+- **Remote login links** - Complete authorization on a browser-enabled machine and sync tokens automatically
+- **Account import/export** - Migrate account configurations across machines
+- **Manual token input** - Paste accessToken / refreshToken directly
+
+### What's New in v1.6.2
+- **Full Codex CLI support** - Uses the OpenAI Responses API (`/v1/responses`)
+  - Full support for tool calls (shell, file, and all other tools)
+  - Image input support (`input_image` type)
+  - Web search support (`web_search` tool)
+  - Error code mapping (`rate_limit`, `context_length`, etc.)
+- **Enhanced Claude Code support** - Full image understanding and web search support
+  - Supports both Anthropic and OpenAI image formats
+  - Supports `web_search` / `web_search_20250305` tools
+
+### What's New in v1.6.1
+- **Request rate limiting** - Reduces account risk by controlling request frequency
+  - Minimum interval per account
+  - Maximum requests per minute per account
+  - Global maximum requests per minute
+  - Configurable in the Web UI settings page
+- **Account anomaly detection** - Automatically detects errors such as `TEMPORARILY_SUSPENDED`
+  - Clear and user-friendly error logs
+  - Automatically disables affected accounts
+  - Automatically switches to another available account
+- **Unified error handling** - Shared error classification and handling logic across all three protocols
+
+### Features in v1.6.0
+- **Conversation history management** - Four strategies for handling context length limits, freely combinable
+  - Auto truncation: preserve the most recent context and summarize earlier messages before sending; truncate by count / chars if necessary
+  - Smart summarization: use AI to summarize earlier conversation while preserving key context
+  - Summary cache: reuse recent summaries when history changes only slightly, reducing repeated LLM calls (enabled by default)
+  - Retry on error: automatically truncate and retry on length errors (enabled by default)
+  - Pre-check estimation: estimate token usage and truncate proactively before hitting the limit
+- **Gemini tool-calling support** - Full support for `functionDeclarations` / `functionCall` / `functionResponse`
+- **Settings page** - Added a settings tab in the Web UI for configuring conversation history management
+
+### Features in v1.5.0
+- **Usage tracking** - Check quota usage, including used / remaining / utilization rate
+- **Multiple login methods** - Supports Google / GitHub / AWS Builder ID
+- **Traffic monitoring** - Full LLM request monitoring with search, filtering, and export
+- **Browser selection** - Automatically detects installed browsers and supports incognito mode
+- **Documentation center** - Built-in help docs with sidebar navigation and Markdown rendering
+
+### Features in v1.4.0
+- **Token pre-refresh** - Background checks every 5 minutes and refreshes tokens 15 minutes before expiry
+- **Health checks** - Verifies account availability every 10 minutes and updates status automatically
+- **Enhanced request statistics** - Stats by account / model, plus 24-hour trends
+- **Retry mechanism** - Automatic retry with exponential backoff for network errors / 5xx responses
 
 ## Tool Calling Support
 
 | Feature | Anthropic (Claude Code) | OpenAI (Codex CLI) | Gemini |
-|---------|------------------------|-------------------|--------|
-| Tool Definition | ✅ `tools` | ✅ `tools.function` | ✅ `functionDeclarations` |
-| Tool Call Response | ✅ `tool_use` | ✅ `tool_calls` | ✅ `functionCall` |
-| Tool Results | ✅ `tool_result` | ✅ `tool` role msg | ✅ `functionResponse` |
-| Force Tool Call | ✅ `tool_choice` | ✅ `tool_choice` | ✅ `toolConfig.mode` |
-| Tool Limit | ✅ 50 | ✅ 50 | ✅ 50 |
-| History Repair | ✅ | ✅ | ✅ |
-| Image Understanding | ✅ | ✅ | ❌ |
-| Web Search | ✅ | ✅ | ❌ |
+|---------|--------------------------|--------------------|--------|
+| Tool definitions | ✅ `tools` | ✅ `tools.function` | ✅ `functionDeclarations` |
+| Tool call response | ✅ `tool_use` | ✅ `tool_calls` | ✅ `functionCall` |
+| Tool result | ✅ `tool_result` | ✅ `tool` role message | ✅ `functionResponse` |
+| Forced tool calling | ✅ `tool_choice` | ✅ `tool_choice` | ✅ `toolConfig.mode` |
+| Tool count limit | ✅ 50 | ✅ 50 | ✅ 50 |
+| History repair | ✅ | ✅ | ✅ |
+| Image understanding | ✅ | ✅ | ❌ |
+| Web search | ✅ | ✅ | ❌ |
 
 ## Known Limitations
 
 ### Conversation Length Limit
 
-Kiro API has input length limits. Long conversations will return:
+The Kiro API has an input length limit. When the conversation history becomes too long, it may return an error like:
 
-```
+```text
 Input is too long. (CONTENT_LENGTH_EXCEEDS_THRESHOLD)
-```
+````
 
 #### Automatic Handling (v1.6.0+)
 
-Built-in history management in Settings page:
+The proxy includes built-in history management, configurable from the **Settings** page:
 
-- **Error Retry** (default): Auto-truncate and retry on length error
-- **Smart Summary**: Use AI to summarize early conversations
-- **Summary Cache** (default): Reuse recent summaries when history hasn't changed much
-- **Auto Truncate**: Prioritize recent context before sending
-- **Pre-estimate**: Estimate tokens before sending, pre-truncate if exceeds
+* **Retry on error** (default): automatically truncate and retry when a length error occurs
+* **Smart summarization**: use AI to summarize earlier conversation while keeping key context
+* **Summary cache** (default): reuse recent summaries when history changes only slightly, reducing repeated LLM calls
+* **Auto truncation**: preserve the latest context and summarize earlier messages before each request; truncate by count / chars if needed
+* **Pre-check estimation**: estimate token usage and truncate before hitting the limit
+
+The summary cache can be tuned with the following config options (default values):
+
+* `summary_cache_enabled`: `true`
+* `summary_cache_min_delta_messages`: `3`
+* `summary_cache_min_delta_chars`: `4000`
+* `summary_cache_max_age_seconds`: `180`
 
 #### Manual Handling
 
-1. Type `/clear` in Claude Code to clear conversation history
-2. Tell AI what you were working on, it will read code files to restore context
+1. In Claude Code, enter `/clear` to clear the conversation history
+2. Tell the AI what you were working on previously; it can read code files to recover context
 
 ## Quick Start
 
-### Option 1: Download Pre-built Binary
+### Option 1: Download Prebuilt Release
 
-Download from [Releases](../../releases) for your platform and run directly.
+Download the package for your platform from [Releases](../../releases), extract it, and run it directly.
 
 ### Option 2: Run from Source
 
 ```bash
-# Clone project
-git clone https://github.com/petehsu/KiroProxy.git
-cd KiroProxy
+# Clone the project
+git clone https://github.com/yourname/kiro-proxy.git
+cd kiro-proxy
 
-# Create virtual environment
+# Create a virtual environment
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
@@ -117,62 +178,68 @@ pip install -r requirements.txt
 # Run
 python run.py
 
-# Or specify port
+# Or specify a port
 python run.py 8081
 ```
 
-Visit http://localhost:8080 after startup.
+After startup, visit:
 
-### CLI Tools
+```text
+http://localhost:8080
+```
 
-Manage accounts on headless servers:
+### Command-Line Interface (CLI)
+
+In headless environments, use the CLI to manage accounts and services:
 
 ```bash
-# Account Management
-python run.py accounts list              # List accounts
-python run.py accounts export -o acc.json  # Export accounts
-python run.py accounts import acc.json   # Import accounts
-python run.py accounts add               # Interactive token add
-python run.py accounts scan --auto       # Scan and auto-add local tokens
+# Account management
+python run.py accounts list                 # List accounts
+python run.py accounts export -o acc.json   # Export accounts
+python run.py accounts import acc.json      # Import accounts
+python run.py accounts add                  # Add token interactively
+python run.py accounts scan --auto          # Scan and auto-add local tokens
 
 # Login
-python run.py login google               # Google login
-python run.py login github               # GitHub login
+python run.py login google                  # Google login
+python run.py login github                  # GitHub login
 python run.py login remote --host myserver.com:8080  # Generate remote login link
 
 # Service
-python run.py serve                      # Start service (default 8080)
-python run.py serve -p 8081              # Specify port
-python run.py status                     # View status
+python run.py serve                         # Start service (default: 8080)
+python run.py serve -p 8081                 # Specify port
+python run.py status                        # Show status
 ```
 
 ### Getting Tokens
 
 **Option 1: Online Login (Recommended)**
-1. Open Web UI, click "Online Login"
-2. Choose: Google / GitHub / AWS Builder ID
-3. Complete authorization in browser
-4. Account added automatically
+
+1. Open the Web UI and click **Online Login**
+2. Choose a login method: Google / GitHub / AWS Builder ID
+3. Complete authorization in the browser
+4. The account will be added automatically
 
 **Option 2: Scan Tokens**
-1. Open Kiro IDE, login with Google/GitHub
-2. Tokens saved to `~/.aws/sso/cache/`
-3. Click "Scan Tokens" in Web UI
+
+1. Open Kiro IDE and sign in with a Google / GitHub account
+2. After login, tokens are automatically saved to `~/.aws/sso/cache/`
+3. Click **Scan Tokens** in the Web UI to add the account
 
 ## CLI Configuration
 
 ### Model Mapping
 
-| Kiro Model | Capability | Claude Code | Codex |
-|------------|------------|-------------|-------|
-| `claude-sonnet-4` | ⭐⭐⭐ Recommended | `claude-sonnet-4` | `gpt-4o` |
-| `claude-sonnet-4.5` | ⭐⭐⭐⭐ Stronger | `claude-sonnet-4.5` | `gpt-4o` |
-| `claude-haiku-4.5` | ⚡ Fast | `claude-haiku-4.5` | `gpt-4o-mini` |
-| `claude-opus-4.5` | ⭐⭐⭐⭐⭐ Strongest | `claude-opus-4.5` | `o1` |
+| Kiro Model          | Capability      | Claude Code         | Codex         |
+| ------------------- | --------------- | ------------------- | ------------- |
+| `claude-sonnet-4`   | ⭐⭐⭐ Recommended | `claude-sonnet-4`   | `gpt-4o`      |
+| `claude-sonnet-4.5` | ⭐⭐⭐⭐ Stronger   | `claude-sonnet-4.5` | `gpt-4o`      |
+| `claude-haiku-4.5`  | ⚡ Faster        | `claude-haiku-4.5`  | `gpt-4o-mini` |
+| `claude-opus-4.5`   | ⭐⭐⭐⭐⭐ Best      | `claude-opus-4.5`   | `o1`          |
 
 ### Claude Code Configuration
 
-```
+```text
 Name: Kiro Proxy
 API Key: any
 Base URL: http://localhost:8080
@@ -180,6 +247,8 @@ Model: claude-sonnet-4
 ```
 
 ### Codex Configuration
+
+Codex CLI uses the OpenAI Responses API. Configure it like this:
 
 ```bash
 # Set environment variables
@@ -190,7 +259,7 @@ export OPENAI_BASE_URL=http://localhost:8080/v1
 codex
 ```
 
-Or in `~/.codex/config.toml`:
+Or configure it in `~/.codex/config.toml`:
 
 ```toml
 [providers.openai]
@@ -200,36 +269,106 @@ base_url = "http://localhost:8080/v1"
 
 ## API Endpoints
 
-| Protocol | Endpoint | Purpose |
-|----------|----------|---------|
-| OpenAI | `POST /v1/chat/completions` | Chat Completions API |
-| OpenAI | `POST /v1/responses` | Responses API (Codex CLI) |
-| OpenAI | `GET /v1/models` | Model list |
-| Anthropic | `POST /v1/messages` | Claude Code |
-| Anthropic | `POST /v1/messages/count_tokens` | Token count |
-| Gemini | `POST /v1/models/{model}:generateContent` | Gemini CLI |
+| Protocol  | Endpoint                                  | Purpose                   |
+| --------- | ----------------------------------------- | ------------------------- |
+| OpenAI    | `POST /v1/chat/completions`               | Chat Completions API      |
+| OpenAI    | `POST /v1/responses`                      | Responses API (Codex CLI) |
+| OpenAI    | `GET /v1/models`                          | Model list                |
+| Anthropic | `POST /v1/messages`                       | Claude Code               |
+| Anthropic | `POST /v1/messages/count_tokens`          | Token counting            |
+| Gemini    | `POST /v1/models/{model}:generateContent` | Gemini CLI                |
 
-### Management API
+### Admin API
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/accounts` | GET | Get all account status |
-| `/api/accounts/{id}` | GET | Get account details |
-| `/api/accounts/{id}/usage` | GET | Get account usage info |
-| `/api/accounts/{id}/refresh` | POST | Refresh account token |
-| `/api/accounts/{id}/restore` | POST | Restore account (from cooldown) |
-| `/api/accounts/refresh-all` | POST | Refresh all expiring tokens |
-| `/api/flows` | GET | Get request records |
-| `/api/flows/stats` | GET | Get request statistics |
-| `/api/quota` | GET | Get quota status |
-| `/api/stats` | GET | Get statistics |
+| Endpoint                     | Method | Description                         |
+| ---------------------------- | ------ | ----------------------------------- |
+| `/api/accounts`              | GET    | Get all account states              |
+| `/api/accounts/{id}`         | GET    | Get account details                 |
+| `/api/accounts/{id}/usage`   | GET    | Get account usage info              |
+| `/api/accounts/{id}/refresh` | POST   | Refresh account token               |
+| `/api/accounts/{id}/restore` | POST   | Restore account from cooldown state |
+| `/api/accounts/refresh-all`  | POST   | Refresh all soon-to-expire tokens   |
+| `/api/flows`                 | GET    | Get traffic logs                    |
+| `/api/flows/stats`           | GET    | Get traffic statistics              |
+| `/api/flows/{id}`            | GET    | Get traffic detail                  |
+| `/api/quota`                 | GET    | Get quota status                    |
+| `/api/stats`                 | GET    | Get statistics                      |
+| `/api/health-check`          | POST   | Trigger health check manually       |
+| `/api/browsers`              | GET    | Get available browsers              |
+| `/api/docs`                  | GET    | Get documentation list              |
+| `/api/docs/{id}`             | GET    | Get documentation content           |
+
+## Project Structure
+
+```text
+kiro_proxy/
+├── main.py                    # FastAPI app entrypoint
+├── config.py                  # Global configuration
+├── converters.py              # Protocol conversion
+│
+├── core/                      # Core modules
+│   ├── account.py            # Account management
+│   ├── state.py              # Global state
+│   ├── persistence.py        # Persistent config storage
+│   ├── scheduler.py          # Background task scheduler
+│   ├── stats.py              # Request statistics
+│   ├── retry.py              # Retry mechanism
+│   ├── browser.py            # Browser detection
+│   ├── flow_monitor.py       # Traffic monitoring
+│   └── usage.py              # Usage query
+│
+├── credential/                # Credential management
+│   ├── types.py              # KiroCredentials
+│   ├── fingerprint.py        # Machine ID generation
+│   ├── quota.py              # Quota manager
+│   └── refresher.py          # Token refresh
+│
+├── auth/                      # Authentication modules
+│   └── device_flow.py        # Device Code Flow / Social Auth
+│
+├── handlers/                  # API handlers
+│   ├── anthropic.py          # /v1/messages
+│   ├── openai.py             # /v1/chat/completions
+│   ├── responses.py          # /v1/responses (Codex CLI)
+│   ├── gemini.py             # /v1/models/{model}:generateContent
+│   └── admin.py              # Admin API
+│
+├── cli.py                     # Command-line interface
+│
+├── docs/                      # Built-in documentation
+│   ├── 01-quickstart.md      # Quick start
+│   ├── 02-features.md        # Features
+│   ├── 03-faq.md             # FAQ
+│   └── 04-api.md             # API reference
+│
+└── web/
+    └── html.py               # Web UI (componentized single file)
+```
+
+## Build
+
+```bash
+# Install build dependency
+pip install pyinstaller
+
+# Build
+python build.py
+```
+
+The output files will be generated in the `dist/` directory.
+
+## Use Cases
+
+* Connect Kiro-related capabilities to clients such as Claude Code, Codex CLI, and Gemini CLI
+* Centralize request routing and account management in multi-account environments
+* Maintain token refresh, quota status, and health checks in one place
+* Provide a unified compatibility layer and observability surface for developer workflows
 
 ## Disclaimer
 
-This project is for educational purposes only. Commercial use is prohibited. Any consequences from using this project are the user's responsibility.
+This project is for learning and research purposes only. Please use it in compliance with the applicable terms of service and relevant usage rules. Any consequences arising from the use of this project are the sole responsibility of the user.
 
-This project is not affiliated with Kiro / AWS / Anthropic.
+This project is not officially affiliated with Kiro, AWS, Anthropic, or OpenAI.
 
-## License
-
-MIT
+```
+```
