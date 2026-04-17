@@ -14,8 +14,21 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config, is_content_length_error
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
-from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, is_quota_exceeded_error
-from ..converters import generate_session_id, convert_openai_messages_to_kiro, extract_images_from_content
+from ..core.auth_guard import ensure_profile_arn_ready
+from ..http_client import get_httpx_verify_setting
+from ..kiro_api import (
+    build_headers,
+    build_kiro_request,
+    parse_event_stream,
+    parse_event_stream_full,
+    is_quota_exceeded_error,
+)
+from ..converters import (
+    generate_session_id,
+    convert_openai_messages_to_kiro,
+    convert_kiro_response_to_openai,
+    extract_images_from_content,
+)
 
 
 async def handle_chat_completions(request: Request):
@@ -29,6 +42,11 @@ async def handle_chat_completions(request: Request):
     stream = body.get("stream", False)
     tools = body.get("tools", None)
     tool_choice = body.get("tool_choice", None)
+    thinking = (
+        ((body.get("extra_body") or {}).get("anthropic") or {}).get("thinking")
+        if isinstance(body.get("extra_body"), dict)
+        else None
+    )
     
     if not messages:
         raise HTTPException(400, "messages required")
@@ -50,13 +68,20 @@ async def handle_chat_completions(request: Request):
     if not token:
         raise HTTPException(500, f"Failed to get token for account {account.name}")
     
+    profile_ok, profile_msg = await ensure_profile_arn_ready(account)
+    if not profile_ok:
+        raise HTTPException(401, profile_msg)
+    
+    token = account.get_token()
+    
     # 使用账号的动态 Machine ID（提前构建，供摘要使用）
     creds = account.get_credentials()
     headers = build_headers(
         token,
         machine_id=account.get_machine_id(),
         profile_arn=creds.profile_arn if creds else None,
-        client_id=creds.client_id if creds else None
+        client_id=creds.client_id if creds else None,
+        uuid=getattr(creds, "uuid", None) if creds else None,
     )
     
     # 限速检查
@@ -68,16 +93,19 @@ async def handle_chat_completions(request: Request):
     
     # 使用增强的转换函数
     user_content, history, tool_results, kiro_tools = convert_openai_messages_to_kiro(
-        messages, model, tools, tool_choice
+        messages, model, tools, tool_choice, thinking
     )
+    
+    # 获取账号凭证
+    creds = account.get_credentials()
     
     # 历史消息预处理
     history_manager = HistoryManager(get_history_config(), cache_key=session_id)
     
     async def call_summary(prompt: str) -> str:
-        req = build_kiro_request(prompt, "claude-haiku-4.5", [])
+        req = build_kiro_request(prompt, "claude-haiku-4.5", [], credentials=creds)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=60) as client:
                 resp = await client.post(KIRO_API_URL, json=req, headers=headers)
                 if resp.status_code == 200:
                     return parse_event_stream(resp.content)
@@ -110,18 +138,20 @@ async def handle_chat_completions(request: Request):
         user_content, model, history, 
         images=images,
         tools=kiro_tools if kiro_tools else None,
-        tool_results=tool_results if tool_results else None
+        tool_results=tool_results if tool_results else None,
+        credentials=creds
     )
     
     error_msg = None
     status_code = 200
     content = ""
+    result_payload = None
     current_account = account
     max_retries = 2
     
     for retry in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=120) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=120) as client:
                 resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
                 status_code = resp.status_code
                 
@@ -140,7 +170,8 @@ async def handle_chat_completions(request: Request):
                             token,
                             machine_id=current_account.get_machine_id(),
                             profile_arn=creds.profile_arn if creds else None,
-                            client_id=creds.client_id if creds else None
+                            client_id=creds.client_id if creds else None,
+                            uuid=getattr(creds, "uuid", None) if creds else None,
                         )
                         continue
                     
@@ -198,7 +229,8 @@ async def handle_chat_completions(request: Request):
                                 user_content, model, history,
                                 images=images,
                                 tools=kiro_tools if kiro_tools else None,
-                                tool_results=tool_results if tool_results else None
+                                tool_results=tool_results if tool_results else None,
+                                credentials=creds
                             )
                             continue
                         else:
@@ -206,7 +238,8 @@ async def handle_chat_completions(request: Request):
                     
                     raise HTTPException(resp.status_code, error.user_message)
                 
-                content = parse_event_stream(resp.content)
+                result_payload = parse_event_stream_full(resp.content)
+                content = "".join(result_payload.get("content", []))
                 current_account.request_count += 1
                 current_account.last_used = time.time()
                 get_rate_limiter().record_request(current_account.id)
@@ -287,15 +320,17 @@ async def handle_chat_completions(request: Request):
         
         return StreamingResponse(generate(), media_type="text/event-stream")
     
-    return {
-        "id": f"chatcmpl-{log_id}",
-        "object": "chat.completion",
-        "created": int(datetime.now().timestamp()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    }
+    if result_payload is None:
+        result_payload = {
+            "content": [content] if content else [],
+            "tool_uses": [],
+            "stop_reason": "end_turn",
+        }
+
+    response_obj = convert_kiro_response_to_openai(
+        result_payload,
+        model,
+        f"chatcmpl-{log_id}",
+    )
+    response_obj["created"] = int(datetime.now().timestamp())
+    return response_obj

@@ -13,6 +13,8 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config, is_content_length_error
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
+from ..core.auth_guard import ensure_profile_arn_ready
+from ..http_client import get_httpx_verify_setting
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
 from ..converters import convert_gemini_contents_to_kiro, convert_kiro_response_to_gemini, convert_gemini_tools_to_kiro
 
@@ -27,6 +29,8 @@ async def handle_generate_content(model_name: str, request: Request):
     system_instruction = body.get("systemInstruction", {})
     tools = body.get("tools", [])
     tool_config = body.get("toolConfig", {})
+    generation_config = body.get("generationConfig", {}) if isinstance(body.get("generationConfig"), dict) else {}
+    thinking_config = generation_config.get("thinkingConfig") if isinstance(generation_config, dict) else None
     
     model_raw = model_name.replace("models/", "")
     model = map_model_name(model_raw)
@@ -48,13 +52,20 @@ async def handle_generate_content(model_name: str, request: Request):
     if not token:
         raise HTTPException(500, f"Failed to get token for account {account.name}")
     
+    profile_ok, profile_msg = await ensure_profile_arn_ready(account)
+    if not profile_ok:
+        raise HTTPException(401, profile_msg)
+    
+    token = account.get_token()
+    
     # 构建 headers（提前构建，供摘要使用）
     creds = account.get_credentials()
     headers = build_headers(
         token,
         machine_id=account.get_machine_id(),
         profile_arn=creds.profile_arn if creds else None,
-        client_id=creds.client_id if creds else None
+        client_id=creds.client_id if creds else None,
+        uuid=getattr(creds, "uuid", None) if creds else None,
     )
     
     # 限速检查
@@ -65,17 +76,20 @@ async def handle_generate_content(model_name: str, request: Request):
         await asyncio.sleep(wait_seconds)
     
     # 转换消息格式
-    user_content, history, tool_results, kiro_tools = convert_gemini_contents_to_kiro(
-        contents, system_instruction, model, tools, tool_config
+    user_content, history, tool_results, kiro_tools, images = convert_gemini_contents_to_kiro(
+        contents, system_instruction, model, tools, tool_config, thinking_config
     )
+    
+    # 获取账号凭证
+    creds = account.get_credentials()
     
     # 历史消息预处理
     history_manager = HistoryManager(get_history_config(), cache_key=session_id)
     
     async def call_summary(prompt: str) -> str:
-        req = build_kiro_request(prompt, "claude-haiku-4.5", [])
+        req = build_kiro_request(prompt, "claude-haiku-4.5", [], credentials=creds)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=60) as client:
                 resp = await client.post(KIRO_API_URL, json=req, headers=headers)
                 if resp.status_code == 200:
                     return parse_event_stream(resp.content)
@@ -95,23 +109,14 @@ async def handle_generate_content(model_name: str, request: Request):
     
     if history_manager.was_truncated:
         print(f"[Gemini] {history_manager.truncate_info}")
-
-    async def call_summary(prompt: str) -> str:
-        req = build_kiro_request(prompt, "claude-haiku-4.5", [])
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
-                resp = await client.post(KIRO_API_URL, json=req, headers=headers)
-                if resp.status_code == 200:
-                    return parse_event_stream(resp.content)
-        except Exception as e:
-            print(f"[Summary] API 调用失败: {e}")
-        return ""
     
     # 构建 Kiro 请求
     kiro_request = build_kiro_request(
         user_content, model, history,
+        images=images,
         tools=kiro_tools if kiro_tools else None,
-        tool_results=tool_results if tool_results else None
+        tool_results=tool_results if tool_results else None,
+        credentials=creds
     )
     
     error_msg = None
@@ -122,7 +127,7 @@ async def handle_generate_content(model_name: str, request: Request):
     
     for retry in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=120) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=120) as client:
                 resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
                 status_code = resp.status_code
                 
@@ -139,7 +144,8 @@ async def handle_generate_content(model_name: str, request: Request):
                             token,
                             machine_id=current_account.get_machine_id(),
                             profile_arn=creds.profile_arn if creds else None,
-                            client_id=creds.client_id if creds else None
+                            client_id=creds.client_id if creds else None,
+                            uuid=getattr(creds, "uuid", None) if creds else None,
                         )
                         continue
                     raise HTTPException(429, "All accounts rate limited")
@@ -194,8 +200,10 @@ async def handle_generate_content(model_name: str, request: Request):
                             history = truncated_history
                             kiro_request = build_kiro_request(
                                 user_content, model, history,
+                                images=images,
                                 tools=kiro_tools if kiro_tools else None,
-                                tool_results=tool_results if tool_results else None
+                                tool_results=tool_results if tool_results else None,
+                                credentials=creds
                             )
                             continue
                         else:

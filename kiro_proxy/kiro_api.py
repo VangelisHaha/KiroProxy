@@ -14,15 +14,16 @@ def build_headers(
     agent_mode: str = "vibe",
     machine_id: str = None,
     profile_arn: str = None,
-    client_id: str = None
+    client_id: str = None,
+    uuid: str = None,
 ) -> dict:
     """构建 Kiro API 请求头"""
     if machine_id:
         return _default_provider.build_headers(token, agent_mode, machine_id=machine_id)
     
     # 如果提供了凭证信息，生成对应的 machine_id
-    if profile_arn or client_id:
-        mid = generate_machine_id(profile_arn, client_id)
+    if profile_arn or client_id or uuid:
+        mid = generate_machine_id(profile_arn=profile_arn, client_id=client_id, uuid=uuid)
         return _default_provider.build_headers(token, agent_mode, machine_id=mid)
     
     return _default_provider.build_headers(token, agent_mode)
@@ -34,9 +35,23 @@ def build_kiro_request(
     history: list = None,
     tools: list = None,
     images: list = None,
-    tool_results: list = None
+    tool_results: list = None,
+    credentials = None
 ) -> dict:
     """构建 Kiro API 请求体"""
+    # 如果提供了凭证，创建临时 provider
+    if credentials:
+        from .providers.kiro import KiroProvider
+        provider = KiroProvider(credentials)
+        return provider.build_request(
+            user_content=user_content,
+            model=model,
+            history=history,
+            tools=tools,
+            images=images,
+            tool_results=tool_results
+        )
+    
     return _default_provider.build_request(
         user_content=user_content,
         model=model,

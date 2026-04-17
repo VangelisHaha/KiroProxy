@@ -39,11 +39,16 @@ class Account:
     def load_credentials(self) -> Optional[KiroCredentials]:
         """加载凭证信息"""
         try:
-            self._credentials = KiroCredentials.from_file(self.token_path)
+            self._credentials = KiroCredentials.load_merged_from_cache(self.token_path)
             
-            if self._credentials.client_id_hash and not self._credentials.client_id:
+            if (
+                self._credentials.client_id_hash
+                and (not self._credentials.client_id or not self._credentials.client_secret)
+            ):
                 self._merge_client_credentials()
-            
+
+            # 凭证刷新后，machine_id 需要重算
+            self._machine_id = None
             return self._credentials
         except Exception as e:
             print(f"[Account] 加载凭证失败 {self.id}: {e}")
@@ -93,7 +98,11 @@ class Account:
         
         creds = self.get_credentials()
         if creds:
-            self._machine_id = generate_machine_id(creds.profile_arn, creds.client_id)
+            self._machine_id = generate_machine_id(
+                profile_arn=creds.profile_arn,
+                client_id=creds.client_id,
+                uuid=creds.uuid,
+            )
         else:
             self._machine_id = generate_machine_id()
         

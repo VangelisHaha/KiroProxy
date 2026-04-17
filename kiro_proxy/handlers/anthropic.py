@@ -13,7 +13,9 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config, is_content_length_error, TruncateStrategy
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
+from ..core.auth_guard import ensure_profile_arn_ready
 from ..credential import quota_manager
+from ..http_client import get_httpx_verify_setting
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream_full, parse_event_stream, is_quota_exceeded_error
 from ..converters import (
     generate_session_id,
@@ -100,9 +102,10 @@ async def handle_count_tokens(request: Request):
 
 async def _call_kiro_for_summary(prompt: str, account, headers: dict) -> str:
     """调用 Kiro API 生成摘要（内部使用）"""
-    kiro_request = build_kiro_request(prompt, "claude-haiku-4.5", [])  # 用快速模型生成摘要
+    creds = account.get_credentials()
+    kiro_request = build_kiro_request(prompt, "claude-haiku-4.5", [], credentials=creds)  # 用快速模型生成摘要
     try:
-        async with httpx.AsyncClient(verify=False, timeout=60) as client:
+        async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=60) as client:
             resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
             if resp.status_code == 200:
                 return parse_event_stream(resp.content)
@@ -122,6 +125,7 @@ async def handle_messages(request: Request):
     system = body.get("system", "")
     stream = body.get("stream", False)
     tools = body.get("tools", [])
+    thinking = body.get("thinking")
     
     # 调试：打印原始请求的关键信息
     print(f"[Anthropic] Request: model={body.get('model')} -> {model}, messages={len(messages)}, stream={stream}, tools={len(tools)}")
@@ -158,13 +162,21 @@ async def handle_messages(request: Request):
         flow_monitor.fail_flow(flow_id, "authentication_error", f"Failed to get token for account {account.name}")
         raise HTTPException(500, f"Failed to get token for account {account.name}")
     
+    profile_ok, profile_msg = await ensure_profile_arn_ready(account)
+    if not profile_ok:
+        flow_monitor.fail_flow(flow_id, "authentication_error", profile_msg, 401)
+        raise HTTPException(401, profile_msg)
+    
+    token = account.get_token()
+    
     # 使用账号的动态 Machine ID（提前构建，供摘要使用）
     creds = account.get_credentials()
     headers = build_headers(
         token,
         machine_id=account.get_machine_id(),
         profile_arn=creds.profile_arn if creds else None,
-        client_id=creds.client_id if creds else None
+        client_id=creds.client_id if creds else None,
+        uuid=getattr(creds, "uuid", None) if creds else None,
     )
     
     # 限速检查
@@ -175,7 +187,7 @@ async def handle_messages(request: Request):
         await asyncio.sleep(wait_seconds)
     
     # 转换消息格式
-    user_content, history, tool_results = convert_anthropic_messages_to_kiro(messages, system)
+    user_content, history, tool_results = convert_anthropic_messages_to_kiro(messages, system, thinking)
     
     # 历史消息预处理
     history_manager = HistoryManager(get_history_config(), cache_key=session_id)
@@ -204,7 +216,7 @@ async def handle_messages(request: Request):
     
     # 构建 Kiro 请求
     kiro_tools = convert_anthropic_tools_to_kiro(tools) if tools else None
-    kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
+    kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results, creds)
     
     if stream:
         return await _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)
@@ -224,7 +236,7 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
         
         while retry_count <= max_retries:
             try:
-                async with httpx.AsyncClient(verify=False, timeout=300) as client:
+                async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=300) as client:
                     async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers) as response:
                         
                         # 处理配额超限
@@ -320,7 +332,7 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                     print(f"[Stream] 内容长度超限，{history_manager.truncate_info}")
                                     history = truncated_history
                                     # 重新构建请求
-                                    kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
+                                    kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results, creds)
                                     retry_count += 1
                                     continue
                             
@@ -455,7 +467,7 @@ async def _handle_non_stream(kiro_request, headers, account, model, log_id, star
 
     for retry in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(verify=False, timeout=300) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=300) as client:
                 response = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
                 status_code = response.status_code
 
@@ -519,7 +531,7 @@ async def _handle_non_stream(kiro_request, headers, account, model, log_id, star
                         if should_retry:
                             print(f"[NonStream] 内容长度超限，{history_manager.truncate_info}")
                             history = truncated_history
-                            kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results)
+                            kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results, creds)
                             continue
                         else:
                             print(f"[NonStream] 内容长度超限但未重试: retry={retry}/{max_retries}")

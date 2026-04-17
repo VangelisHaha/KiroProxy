@@ -1,66 +1,98 @@
 #!/usr/bin/env python3
-"""测试 Kiro 反向代理"""
+"""Kiro Proxy 协议端点测试（Anthropic/OpenAI/Gemini/Responses）"""
 
+import os
 import requests
-import json
 
-PROXY_URL = "http://127.0.0.1:8000"
+PROXY_URL = os.getenv("PROXY_URL", "http://127.0.0.1:8080")
 
-def test_health():
-    print("1. 测试健康检查...")
-    r = requests.get(f"{PROXY_URL}/")
-    print(f"   ✅ {r.json()}")
 
-def test_token():
-    print("\n2. 检查 Token 状态...")
-    r = requests.get(f"{PROXY_URL}/token/status")
-    data = r.json()
-    if data.get("valid"):
-        print(f"   ✅ Token 有效，过期时间: {data.get('expires_at')}")
-    else:
-        print(f"   ❌ Token 无效: {data.get('error')}")
+def _post(path: str, payload: dict, timeout: int = 30):
+    return requests.post(f"{PROXY_URL}{path}", json=payload, timeout=timeout)
+
+
+def test_status():
+    print("1. 服务状态...")
+    response = requests.get(f"{PROXY_URL}/api/status", timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    print(f"   ✅ ok={data.get('ok')} available_accounts={data.get('has_available_accounts')}")
+
+
+def test_anthropic_count_tokens():
+    print("\n2. Anthropic count_tokens...")
+    payload = {
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        "system": "test",
+    }
+    response = _post("/v1/messages/count_tokens", payload, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    print(f"   ✅ input_tokens={data.get('input_tokens')}")
+
 
 def test_models():
-    print("\n3. 列出可用模型...")
-    r = requests.get(f"{PROXY_URL}/v1/models")
-    models = r.json().get("data", [])
-    for m in models:
-        print(f"   - {m['id']}")
+    print("\n3. 模型列表...")
+    response = requests.get(f"{PROXY_URL}/v1/models", timeout=20)
+    response.raise_for_status()
+    models = response.json().get("data", [])
+    print(f"   ✅ models={len(models)}")
 
-def test_chat():
-    print("\n4. 测试聊天接口...")
-    r = requests.post(
-        f"{PROXY_URL}/v1/chat/completions",
-        json={
-            "model": "claude-sonnet-4",
-            "messages": [
-                {"role": "user", "content": "说一句话测试"}
-            ]
-        },
-        timeout=60
-    )
-    
-    if r.status_code == 200:
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        print(f"   ✅ AI 回复: {content[:200]}...")
+
+def test_openai_chat():
+    print("\n4. OpenAI chat/completions...")
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+    }
+    response = _post("/v1/chat/completions", payload, timeout=60)
+    if response.status_code == 200:
+        data = response.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"   ✅ 响应成功，内容长度={len(content)}")
     else:
-        print(f"   ❌ 错误 {r.status_code}: {r.text}")
+        # 没有可用账号时返回 4xx/5xx 也属于可观察结果
+        print(f"   ⚠️ 非 200 响应: {response.status_code} {response.text[:200]}")
+
+
+def test_responses_endpoint():
+    print("\n5. OpenAI /v1/responses...")
+    payload = {
+        "model": "gpt-4o",
+        "stream": False,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say hello"}],
+            }
+        ],
+    }
+    response = _post("/v1/responses", payload, timeout=60)
+    if response.status_code == 200:
+        data = response.json()
+        print(f"   ✅ status={data.get('status')} output_items={len(data.get('output', []))}")
+    else:
+        print(f"   ⚠️ 非 200 响应: {response.status_code} {response.text[:200]}")
+
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("Kiro 反向代理测试")
-    print("=" * 50)
-    
+    print("=" * 60)
+    print(f"Kiro Proxy 协议测试: {PROXY_URL}")
+    print("=" * 60)
+
     try:
-        test_health()
-        test_token()
+        test_status()
+        test_anthropic_count_tokens()
         test_models()
-        test_chat()
-        print("\n" + "=" * 50)
+        test_openai_chat()
+        test_responses_endpoint()
+        print("\n" + "=" * 60)
         print("测试完成")
-        print("=" * 50)
+        print("=" * 60)
     except requests.exceptions.ConnectionError:
-        print("\n❌ 连接失败！请先启动代理服务器:")
-        print("   source venv/bin/activate")
-        print("   python kiro_proxy.py")
+        print("\n❌ 连接失败，请先启动服务:")
+        print("   ./venv/bin/python run.py serve -p 8080")
+    except Exception as exc:
+        print(f"\n❌ 测试失败: {exc}")

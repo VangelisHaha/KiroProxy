@@ -89,6 +89,15 @@ def classify_error(status_code: int, error_text: str) -> KiroError:
         )
     
     # 4. 认证失败检测
+    if "profilearn is required" in error_lower or "value null at 'profilearn'" in error_lower:
+        return KiroError(
+            type=ErrorType.AUTH_FAILED,
+            status_code=status_code,
+            message=error_text,
+            user_message="当前账号缺少 profileArn，请重新登录或更换有效账号",
+            should_switch_account=True,
+        )
+
     if status_code == 401 or "unauthorized" in error_lower or "invalid token" in error_lower:
         return KiroError(
             type=ErrorType.AUTH_FAILED,

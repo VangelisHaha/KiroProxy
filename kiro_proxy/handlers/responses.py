@@ -6,7 +6,10 @@ import json
 import uuid
 import time
 import asyncio
+import os
+import re
 import httpx
+from typing import Any, Dict, Optional, Tuple
 from fastapi import Request, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -16,7 +19,240 @@ from ..core.state import RequestLog
 from ..core.history_manager import HistoryManager, get_history_config
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
+from ..core.auth_guard import ensure_profile_arn_ready
+from ..http_client import get_httpx_verify_setting
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
+
+
+_DEBUG_RESPONSES = os.getenv("KIRO_PROXY_DEBUG_RESPONSES", "").lower() in {"1", "true", "yes", "on"}
+_TOOL_CALL_TYPES = {"function_call", "custom_tool_call", "local_shell_call", "tool_search_call"}
+_TOOL_OUTPUT_TYPES = {"function_call_output", "custom_tool_call_output", "mcp_tool_call_output", "tool_search_output"}
+_SPECIAL_ASSISTANT_CALL_TYPES = {"web_search_call", "image_generation_call"}
+
+
+def _debug(message: str):
+    if _DEBUG_RESPONSES:
+        print(message)
+
+
+def _parse_data_image(image_url: str) -> Optional[dict]:
+    if not isinstance(image_url, str) or not image_url.startswith("data:"):
+        return None
+    match = re.match(r"data:image/([\w.+-]+);base64,(.+)", image_url)
+    if not match:
+        return None
+    return {
+        "format": match.group(1).lower(),
+        "source": {"bytes": match.group(2)}
+    }
+
+
+def _extract_text_and_images_from_message_content(content: Any) -> Tuple[str, list]:
+    if isinstance(content, str):
+        return content, []
+
+    blocks = content if isinstance(content, list) else [content]
+    text_parts = []
+    images = []
+
+    for block in blocks:
+        if isinstance(block, str):
+            if block:
+                text_parts.append(block)
+            continue
+
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type", "")
+        if block_type in {"input_text", "output_text", "text", "summary_text", "reasoning_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+            continue
+
+        if block_type == "input_image":
+            image_url = block.get("image_url", "")
+            if isinstance(image_url, dict):
+                image_url = image_url.get("url", "")
+            parsed = _parse_data_image(image_url)
+            if parsed:
+                images.append(parsed)
+            continue
+
+        # 兼容 mcp output 里的 text block
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+
+    return "\n".join(text_parts), images
+
+
+def _safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _extract_tool_output_text(output: Any) -> str:
+    if output is None:
+        return ""
+
+    if isinstance(output, str):
+        return output
+
+    if isinstance(output, list):
+        text, _ = _extract_text_and_images_from_message_content(output)
+        return text if text else _safe_json_dumps(output)
+
+    if isinstance(output, dict):
+        if isinstance(output.get("content"), str):
+            return output["content"]
+        if isinstance(output.get("content"), list):
+            content_text, _ = _extract_text_and_images_from_message_content(output["content"])
+            if content_text:
+                return content_text
+        if isinstance(output.get("text"), str):
+            return output["text"]
+        if "result" in output and isinstance(output["result"], (str, int, float, bool)):
+            return str(output["result"])
+        return _safe_json_dumps(output)
+
+    return str(output)
+
+
+def _parse_tool_output(item: dict) -> Optional[dict]:
+    call_id = item.get("call_id") or item.get("id")
+    if not call_id:
+        _debug(f"[Responses] Skip tool output without call_id: type={item.get('type')}")
+        return None
+
+    output = item.get("output")
+    if output is None and item.get("type") == "tool_search_output":
+        output = {
+            "status": item.get("status"),
+            "execution": item.get("execution"),
+            "tools": item.get("tools", []),
+        }
+
+    status = "success"
+    status_raw = str(item.get("status", "")).lower()
+    if status_raw in {"error", "failed", "failure", "cancelled", "canceled"}:
+        status = "error"
+
+    if isinstance(output, dict):
+        if output.get("success") is False or output.get("is_error") is True or output.get("isError") is True:
+            status = "error"
+
+    output_text = _extract_tool_output_text(output)
+    if not output_text:
+        output_text = "Tool execution completed."
+
+    return {
+        "content": [{"text": output_text}],
+        "status": status,
+        "toolUseId": str(call_id),
+    }
+
+
+def _parse_tool_call(item: dict) -> Optional[dict]:
+    item_type = item.get("type", "")
+    call_id = item.get("call_id") or item.get("id")
+    if not call_id:
+        _debug(f"[Responses] Skip tool call without call_id: type={item_type}")
+        return None
+
+    name = item.get("name") or item_type
+    tool_input: Dict[str, Any] = {}
+
+    if item_type == "function_call":
+        namespace = item.get("namespace")
+        if isinstance(namespace, str) and namespace.strip():
+            name = f"{namespace.strip()}.{name}"
+        arguments = item.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                tool_input = json.loads(arguments)
+            except Exception:
+                tool_input = {"raw_arguments": arguments}
+        elif isinstance(arguments, dict):
+            tool_input = arguments
+        else:
+            tool_input = {"raw_arguments": str(arguments)}
+
+    elif item_type == "custom_tool_call":
+        raw_input = item.get("input", "")
+        if isinstance(raw_input, dict):
+            tool_input = raw_input
+        elif isinstance(raw_input, str):
+            tool_input = {"input": raw_input}
+        else:
+            tool_input = {"input": str(raw_input)}
+
+    elif item_type == "local_shell_call":
+        name = "local_shell"
+        action = item.get("action", {})
+        if isinstance(action, dict):
+            tool_input = action
+        elif action:
+            tool_input = {"action": action}
+
+    elif item_type == "tool_search_call":
+        name = "tool_search"
+        arguments = item.get("arguments", {})
+        if isinstance(arguments, dict):
+            tool_input = arguments
+        elif isinstance(arguments, str):
+            try:
+                tool_input = json.loads(arguments)
+            except Exception:
+                tool_input = {"query": arguments}
+        else:
+            tool_input = {"query": str(arguments)}
+
+        execution = item.get("execution")
+        if execution and "execution" not in tool_input:
+            tool_input["execution"] = execution
+
+    if not isinstance(tool_input, dict):
+        tool_input = {"input": str(tool_input)}
+
+    return {
+        "toolUseId": str(call_id),
+        "name": str(name),
+        "input": tool_input,
+    }
+
+
+def _summarize_special_assistant_call(item: dict) -> str:
+    item_type = item.get("type", "")
+    status = str(item.get("status") or "completed")
+
+    if item_type == "web_search_call":
+        action = item.get("action", {})
+        if not isinstance(action, dict):
+            action = {}
+        action_type = str(action.get("type") or "search")
+        query = str(action.get("query") or "").strip()
+        if query:
+            return f"[web_search_call:{status}] {action_type}: {query}"
+        return f"[web_search_call:{status}] {action_type}"
+
+    if item_type == "image_generation_call":
+        revised_prompt = str(item.get("revised_prompt") or "").strip()
+        result = item.get("result")
+        result_note = ""
+        if isinstance(result, str) and result.startswith("data:image/"):
+            result_note = "result=data_image"
+        elif result:
+            result_note = "result=present"
+
+        parts = [f"[image_generation_call:{status}]"]
+        if revised_prompt:
+            parts.append(f"prompt={revised_prompt}")
+        if result_note:
+            parts.append(result_note)
+        return " ".join(parts)
+
+    return ""
 
 
 def _convert_responses_input_to_kiro(input_data, instructions: str = None):
@@ -52,38 +288,70 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
     pending_user_texts = []
     pending_tool_uses = []
     pending_tool_outputs = []
-    last_was_assistant_with_tools = False
+
+    def _flush_pending_tool_uses(default_content: str = "I will use available tools."):
+        nonlocal pending_tool_uses
+        if not pending_tool_uses:
+            return
+        if history and "assistantResponseMessage" in history[-1]:
+            history[-1]["assistantResponseMessage"].setdefault("toolUses", []).extend(pending_tool_uses)
+        else:
+            history.append({
+                "assistantResponseMessage": {
+                    "content": default_content,
+                    "toolUses": pending_tool_uses
+                }
+            })
+        pending_tool_uses = []
+
+    def _flush_pending_user():
+        nonlocal pending_user_texts, pending_tool_outputs, first_user_msg_added
+        if pending_user_texts:
+            combined_user = "\n\n".join(pending_user_texts)
+            if not first_user_msg_added and instructions:
+                combined_user = f"{instructions}\n\n{combined_user}"
+                first_user_msg_added = True
+
+            user_msg = {
+                "userInputMessage": {
+                    "content": combined_user,
+                    "modelId": model_id,
+                    "origin": "AI_EDITOR"
+                }
+            }
+            if pending_tool_outputs:
+                _flush_pending_tool_uses()
+                user_msg["userInputMessage"]["userInputMessageContext"] = {
+                    "toolResults": pending_tool_outputs
+                }
+                pending_tool_outputs = []
+
+            history.append(user_msg)
+            pending_user_texts = []
+            return
+
+        if pending_tool_outputs:
+            _flush_pending_tool_uses()
+            history.append({
+                "userInputMessage": {
+                    "content": "Tool execution completed.",
+                    "modelId": model_id,
+                    "origin": "AI_EDITOR",
+                    "userInputMessageContext": {
+                        "toolResults": pending_tool_outputs
+                    }
+                }
+            })
+            pending_tool_outputs = []
     
-    for i, item in enumerate(input_data):
+    for item in input_data:
+        if not isinstance(item, dict):
+            continue
         item_type = item.get("type", "")
-        is_last = (i == len(input_data) - 1)
         
         if item_type == "message":
             role = item.get("role", "user")
-            content_list = item.get("content", [])
-            
-            # 提取文本和图片
-            text_parts = []
-            images = []
-            for c in content_list:
-                if isinstance(c, str):
-                    text_parts.append(c)
-                elif isinstance(c, dict):
-                    c_type = c.get("type", "")
-                    if c_type in ("input_text", "output_text", "text"):
-                        text_parts.append(c.get("text", ""))
-                    elif c_type == "input_image":
-                        image_url = c.get("image_url", "")
-                        if image_url.startswith("data:"):
-                            import re
-                            match = re.match(r'data:image/(\w+);base64,(.+)', image_url)
-                            if match:
-                                images.append({
-                                    "format": match.group(1),
-                                    "source": {"bytes": match.group(2)}
-                                })
-            
-            text = "\n".join(text_parts) if text_parts else ""
+            text, images = _extract_text_and_images_from_message_content(item.get("content", []))
             
             if role == "user":
                 if images:
@@ -91,43 +359,8 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
                 pending_user_texts.append(text)
             
             elif role == "assistant":
-                # 遇到 assistant 消息，先处理之前的 user 消息
-                if pending_user_texts:
-                    combined_user = "\n\n".join(pending_user_texts)
-                    if not first_user_msg_added and instructions:
-                        combined_user = f"{instructions}\n\n{combined_user}"
-                        first_user_msg_added = True
-                    
-                    user_msg = {
-                        "userInputMessage": {
-                            "content": combined_user,
-                            "modelId": model_id,
-                            "origin": "AI_EDITOR"
-                        }
-                    }
-                    # 如果上一个 assistant 有工具调用，这个 user 消息需要带 toolResults
-                    if pending_tool_outputs:
-                        user_msg["userInputMessage"]["userInputMessageContext"] = {
-                            "toolResults": pending_tool_outputs
-                        }
-                        pending_tool_outputs = []
-                    
-                    history.append(user_msg)
-                    pending_user_texts = []
-                elif pending_tool_outputs:
-                    # 没有 user 消息，但有工具结果，创建一个带 toolResults 的 user 消息
-                    user_msg = {
-                        "userInputMessage": {
-                            "content": "Tool execution completed.",
-                            "modelId": model_id,
-                            "origin": "AI_EDITOR",
-                            "userInputMessageContext": {
-                                "toolResults": pending_tool_outputs
-                            }
-                        }
-                    }
-                    history.append(user_msg)
-                    pending_tool_outputs = []
+                # 遇到 assistant 消息，先处理之前的 user/tool output
+                _flush_pending_user()
                 
                 # 添加 assistant 消息
                 assistant_msg = {
@@ -138,64 +371,45 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
                 if pending_tool_uses:
                     assistant_msg["assistantResponseMessage"]["toolUses"] = pending_tool_uses
                     pending_tool_uses = []
-                    last_was_assistant_with_tools = True
-                else:
-                    # 没有 toolUses 时不添加这个字段
-                    last_was_assistant_with_tools = False
                 
                 history.append(assistant_msg)
+
+        elif item_type in _SPECIAL_ASSISTANT_CALL_TYPES:
+            summary = _summarize_special_assistant_call(item)
+            if not summary:
+                continue
+            _flush_pending_user()
+            _flush_pending_tool_uses()
+            history.append({
+                "assistantResponseMessage": {
+                    "content": summary
+                }
+            })
         
-        elif item_type == "function_call":
-            try:
-                args = json.loads(item.get("arguments", "{}")) if isinstance(item.get("arguments"), str) else item.get("arguments", {})
-            except:
-                args = {}
-            
-            tool_use = {
-                "toolUseId": item.get("call_id", ""),
-                "name": item.get("name", ""),
-                "input": args
-            }
-            
+        elif item_type in _TOOL_CALL_TYPES:
+            tool_use = _parse_tool_call(item)
+            if not tool_use:
+                continue
+
             # 如果上一条是 assistant 消息，添加 toolUses
             if history and "assistantResponseMessage" in history[-1]:
-                if "toolUses" not in history[-1]["assistantResponseMessage"]:
-                    history[-1]["assistantResponseMessage"]["toolUses"] = []
-                history[-1]["assistantResponseMessage"]["toolUses"].append(tool_use)
-                last_was_assistant_with_tools = True
+                history[-1]["assistantResponseMessage"].setdefault("toolUses", []).append(tool_use)
             else:
                 pending_tool_uses.append(tool_use)
         
-        elif item_type == "function_call_output":
-            call_id = item.get("call_id", "")
-            output = item.get("output", {})
-            
-            # 跳过没有 call_id 的 tool output
-            if not call_id:
-                print(f"[Responses] Warning: function_call_output without call_id, skipping")
-                continue
-            
-            if isinstance(output, str):
-                output_str = output
-                status = "success"
-            elif isinstance(output, dict):
-                output_str = output.get("content", json.dumps(output))
-                status = "success" if output.get("success", True) is not False else "error"
-            else:
-                output_str = str(output)
-                status = "success"
-            
-            pending_tool_outputs.append({
-                "content": [{"text": output_str}],
-                "status": status,
-                "toolUseId": call_id
-            })
+        elif item_type in _TOOL_OUTPUT_TYPES:
+            tool_output = _parse_tool_output(item)
+            if tool_output:
+                pending_tool_outputs.append(tool_output)
     
     # 处理剩余的消息
+    if pending_tool_outputs:
+        _flush_pending_tool_uses()
+
     if pending_user_texts:
-        user_content = "\n\n".join(pending_user_texts)
+        user_content = "\n\n".join([t for t in pending_user_texts if t])
         if not first_user_msg_added and instructions:
-            user_content = f"{instructions}\n\n{user_content}"
+            user_content = f"{instructions}\n\n{user_content}" if user_content else instructions
     elif pending_tool_outputs:
         user_content = "Please continue based on the tool results."
     
@@ -217,24 +431,14 @@ def _convert_responses_input_to_kiro(input_data, instructions: str = None):
                 # 确保配对一致
                 if has_tool_uses and not has_tool_results:
                     # assistant 有 toolUses 但 user 没有 toolResults，清除 toolUses
-                    print(f"[Responses] Warning: history[{i}] has toolUses but history[{i+1}] has no toolResults, removing toolUses")
+                    _debug(f"[Responses] history[{i}] has toolUses but history[{i + 1}] has no toolResults, removing toolUses")
                     assistant.pop("toolUses", None)
                 elif not has_tool_uses and has_tool_results:
                     # assistant 没有 toolUses 但 user 有 toolResults，清除 toolResults
-                    print(f"[Responses] Warning: history[{i}] has no toolUses but history[{i+1}] has toolResults, removing toolResults")
+                    _debug(f"[Responses] history[{i}] has no toolUses but history[{i + 1}] has toolResults, removing toolResults")
                     user.pop("userInputMessageContext", None)
     
-    # 调试日志
-    print(f"[Responses] Converted: history={len(history)}, tool_results={len(tool_results)}")
-    for i, h in enumerate(history):
-        if "userInputMessage" in h:
-            has_tr = "toolResults" in h.get("userInputMessage", {}).get("userInputMessageContext", {})
-            print(f"[Responses]   history[{i}]: userInputMessage, has_toolResults={has_tr}")
-        elif "assistantResponseMessage" in h:
-            arm = h.get("assistantResponseMessage", {})
-            has_tu_field = "toolUses" in arm
-            tu_count = len(arm.get("toolUses", []) or []) if has_tu_field else 0
-            print(f"[Responses]   history[{i}]: assistantResponseMessage, has_toolUses_field={has_tu_field}, toolUses_count={tu_count}")
+    _debug(f"[Responses] Converted: history={len(history)}, tool_results={len(tool_results)}, images={len(pending_images)}")
     
     images = pending_images if pending_images else None
     return user_content, history, tool_results, images
@@ -278,23 +482,83 @@ def _convert_tools_to_kiro(tools: list) -> list:
         return None
     
     MAX_TOOLS = 50  # Kiro API 工具数量限制
+    MAX_DESCRIPTION_LENGTH = 9216
     kiro_tools = []
     function_count = 0
+
+    def add_tool_spec(name: str, description: str, parameters: dict):
+        nonlocal function_count
+        if function_count >= MAX_TOOLS or not name:
+            return
+        function_count += 1
+        kiro_tools.append({
+                "toolSpecification": {
+                    "name": name,
+                    "description": (description or f"Tool: {name}")[:MAX_DESCRIPTION_LENGTH],
+                    "inputSchema": {"json": parameters or {"type": "object", "properties": {}}}
+                }
+            })
     
     for tool in tools:
         tool_type = tool.get("type", "")
         
         # 特殊工具类型
-        if tool_type == "web_search":
-            # Kiro 支持 web_search
+        if tool_type in {"web_search", "web_search_preview"}:
+            # external_web_access=false 明确关闭联网时，不向 Kiro 暴露 web_search
+            if tool.get("external_web_access") is False:
+                continue
             kiro_tools.append({
                 "webSearchTool": {
                     "type": "web_search"
                 }
             })
             continue
-        elif tool_type == "local_shell":
-            # local_shell 是 OpenAI 原生工具，Kiro 不支持，跳过
+
+        if tool_type == "local_shell":
+            # 将 local_shell 降级映射为普通函数工具，保留命令执行能力
+            add_tool_spec(
+                "local_shell",
+                tool.get("description", "Execute shell commands in a controlled environment."),
+                {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Command tokens, e.g. [\"ls\", \"-la\"]"
+                        },
+                        "workdir": {"type": "string"},
+                        "timeout_ms": {"type": "integer", "minimum": 1},
+                        "justification": {"type": "string"},
+                        "sandbox_permissions": {"type": "string"},
+                    },
+                    "required": ["command"]
+                }
+            )
+            continue
+
+        if tool_type == "tool_search":
+            add_tool_spec(
+                "tool_search",
+                tool.get("description", "Search available tools."),
+                tool.get("parameters", {"type": "object", "properties": {"query": {"type": "string"}}})
+            )
+            continue
+
+        if tool_type == "image_generation":
+            add_tool_spec(
+                "image_generation",
+                tool.get("description", "Generate an image from prompt text."),
+                {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string"},
+                        "size": {"type": "string"},
+                        "output_format": {"type": "string"},
+                    },
+                    "required": ["prompt"]
+                }
+            )
             continue
         
         # 限制工具数量
@@ -308,43 +572,33 @@ def _convert_tools_to_kiro(tools: list) -> list:
             if "function" in tool:
                 func = tool["function"]
                 name = func.get("name", "")
-                description = func.get("description", "")[:500]
+                description = func.get("description", "")[:MAX_DESCRIPTION_LENGTH]
                 parameters = func.get("parameters", {"type": "object", "properties": {}})
             else:
                 # Responses API 格式
                 name = tool.get("name", "")
-                description = tool.get("description", "")[:500]
+                description = tool.get("description", "")[:MAX_DESCRIPTION_LENGTH]
                 parameters = tool.get("parameters", {"type": "object", "properties": {}})
         elif tool_type == "custom":
             # 自定义工具格式
             name = tool.get("name", "")
-            description = tool.get("description", "")[:500]
+            description = tool.get("description", "")[:MAX_DESCRIPTION_LENGTH]
             # custom 工具可能有不同的 schema 格式
             fmt = tool.get("format", {})
             if fmt.get("type") == "json_schema":
                 parameters = fmt.get("schema", {"type": "object", "properties": {}})
             else:
-                parameters = {"type": "object", "properties": {}}
+                parameters = {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                    "required": ["input"]
+                }
         else:
-            name = tool.get("name", "")
-            description = tool.get("description", "")[:500]
+            name = tool.get("name", "") or tool_type
+            description = tool.get("description", "")[:MAX_DESCRIPTION_LENGTH]
             parameters = tool.get("parameters", tool.get("input_schema", {"type": "object", "properties": {}}))
         
-        if not name:
-            continue
-        
-        function_count += 1
-        
-        # 转换为 Kiro 格式
-        kiro_tools.append({
-            "toolSpecification": {
-                "name": name,
-                "description": description or f"Tool: {name}",
-                "inputSchema": {
-                    "json": parameters
-                }
-            }
-        })
+        add_tool_spec(name, description, parameters)
     
     return kiro_tools if kiro_tools else None
 
@@ -379,12 +633,19 @@ async def handle_responses(request: Request):
     if not token:
         raise HTTPException(500, f"Failed to get token for account {account.name}")
     
+    profile_ok, profile_msg = await ensure_profile_arn_ready(account)
+    if not profile_ok:
+        raise HTTPException(401, profile_msg)
+    
+    token = account.get_token()
+    
     creds = account.get_credentials()
     headers = build_headers(
         token,
         machine_id=account.get_machine_id(),
         profile_arn=creds.profile_arn if creds else None,
-        client_id=creds.client_id if creds else None
+        client_id=creds.client_id if creds else None,
+        uuid=getattr(creds, "uuid", None) if creds else None,
     )
     
     rate_limiter = get_rate_limiter()
@@ -400,6 +661,9 @@ async def handle_responses(request: Request):
     
     history_manager = HistoryManager(get_history_config(), cache_key=session_id)
     
+    # 获取账号凭证
+    creds = account.get_credentials()
+    
     # 对于 Responses API，强制启用自动截断（Codex CLI 的历史可能很长）
     from ..core.history_manager import TruncateStrategy
     if TruncateStrategy.AUTO_TRUNCATE not in history_manager.config.strategies:
@@ -407,9 +671,9 @@ async def handle_responses(request: Request):
     
     # 创建摘要 API 调用函数
     async def api_caller(prompt: str) -> str:
-        req = build_kiro_request(prompt, "claude-haiku-4.5", [])
+        req = build_kiro_request(prompt, "claude-haiku-4.5", [], credentials=creds)
         try:
-            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=60) as client:
                 resp = await client.post(KIRO_API_URL, json=req, headers=headers)
                 if resp.status_code == 200:
                     return parse_event_stream(resp.content)
@@ -432,47 +696,60 @@ async def handle_responses(request: Request):
     kiro_tools = _convert_tools_to_kiro(tools)
     
     # 调试：打印 input 结构
-    if isinstance(input_data, list):
+    if _DEBUG_RESPONSES and isinstance(input_data, list):
         for i, item in enumerate(input_data):
             item_type = item.get("type", "?")
             role = item.get("role", "?")
-            print(f"[Responses] input[{i}]: type={item_type}, role={role}")
-        print(f"[Responses] history len: {len(history)}, tool_results len: {len(tool_results)}, images: {len(images) if images else 0}")
-        print(f"[Responses] user_content len: {len(user_content)}")
+            _debug(f"[Responses] input[{i}]: type={item_type}, role={role}")
+        _debug(f"[Responses] history len={len(history)}, tool_results={len(tool_results)}, images={len(images) if images else 0}")
+        _debug(f"[Responses] user_content len={len(user_content)}")
     
     # 验证 tool_results 与 history 的一致性
     if tool_results and history:
-        # 找到最后一个 assistant 消息
-        last_assistant = None
+        # 从末尾向前找“最近一个包含 toolUses 的 assistant”。
+        # Codex 可能在 tool call 之后追加 web_search_call/image_generation_call，
+        # 这些 assistant 条目没有 toolUses，不应导致 tool_results 被误清空。
         last_assistant_idx = -1
+        last_assistant = None
+        last_assistant_with_tools_idx = -1
+        last_assistant_with_tools = None
+
         for i, msg in enumerate(reversed(history)):
-            if "assistantResponseMessage" in msg:
-                last_assistant = msg["assistantResponseMessage"]
-                last_assistant_idx = len(history) - 1 - i
+            if "assistantResponseMessage" not in msg:
+                continue
+            assistant_msg = msg["assistantResponseMessage"]
+            idx = len(history) - 1 - i
+            if last_assistant is None:
+                last_assistant = assistant_msg
+                last_assistant_idx = idx
+            if assistant_msg.get("toolUses"):
+                last_assistant_with_tools = assistant_msg
+                last_assistant_with_tools_idx = idx
                 break
-        
-        if last_assistant:
+
+        target_assistant = last_assistant_with_tools or last_assistant
+        target_idx = last_assistant_with_tools_idx if last_assistant_with_tools else last_assistant_idx
+
+        if target_assistant:
             tool_use_ids = set()
-            for tu in last_assistant.get("toolUses", []) or []:
+            for tu in target_assistant.get("toolUses", []) or []:
                 tu_id = tu.get("toolUseId")
                 if tu_id:
                     tool_use_ids.add(tu_id)
-            
-            print(f"[Responses] Last assistant at idx={last_assistant_idx}, toolUse_ids={tool_use_ids}")
-            print(f"[Responses] tool_results ids={[tr.get('toolUseId') for tr in tool_results]}")
-            
-            # 过滤 tool_results，只保留有对应 toolUse 的
+
+            _debug(f"[Responses] Target assistant idx={target_idx}, toolUse_ids={tool_use_ids}")
+            _debug(f"[Responses] tool_results ids={[tr.get('toolUseId') for tr in tool_results]}")
+
             if tool_use_ids:
                 filtered_results = [tr for tr in tool_results if tr.get("toolUseId") in tool_use_ids]
                 if len(filtered_results) != len(tool_results):
-                    print(f"[Responses] Filtered tool_results: {len(tool_results)} -> {len(filtered_results)}")
-                    tool_results = filtered_results
+                    _debug(f"[Responses] Filtered tool_results: {len(tool_results)} -> {len(filtered_results)}")
+                tool_results = filtered_results
             else:
-                # 如果最后一个 assistant 没有 toolUses，清空 tool_results
-                print(f"[Responses] Warning: Last assistant has no toolUses, clearing tool_results")
+                _debug("[Responses] No assistant with toolUses for current tool_results, clearing")
                 tool_results = []
         else:
-            print(f"[Responses] Warning: No assistant message in history, clearing tool_results")
+            _debug("[Responses] No assistant message in history, clearing tool_results")
             tool_results = []
     
     # 确保所有消息都有非空的 content
@@ -490,11 +767,12 @@ async def handle_responses(request: Request):
         user_content, model, history,
         tools=kiro_tools,
         images=images,
-        tool_results=tool_results if tool_results else None
+        tool_results=tool_results if tool_results else None,
+        credentials=creds
     )
     
     # 调试：打印完整的 Kiro 请求（使用深拷贝避免修改原始请求）
-    if tool_results:
+    if tool_results and _DEBUG_RESPONSES:
         import copy
         # 打印请求结构（不包括 tools，因为太长）
         debug_request = copy.deepcopy({
@@ -509,13 +787,13 @@ async def handle_responses(request: Request):
             if "tools" in ctx:
                 ctx["tools_count"] = len(ctx["tools"])
                 del ctx["tools"]
-        print(f"[Responses] Kiro request structure: {json.dumps(debug_request, indent=2)}")
+        _debug(f"[Responses] Kiro request structure: {json.dumps(debug_request, indent=2)}")
     
     if stream:
         return await _handle_stream(kiro_request, headers, account, model, log_id, start_time)
     
     # 非流式
-    async with httpx.AsyncClient(verify=False, timeout=120) as client:
+    async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=120) as client:
         resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, resp.text)
@@ -542,10 +820,11 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
         })
     
     for tool_use in result.get("tool_uses", []):
+        call_id = tool_use.get("id") or f"call_{uuid.uuid4().hex[:12]}"
         output.append({
             "type": "function_call",
-            "id": tool_use.get("id", f"call_{uuid.uuid4().hex[:12]}"),
-            "call_id": tool_use.get("id", f"call_{uuid.uuid4().hex[:12]}"),
+            "id": call_id,
+            "call_id": call_id,
             "name": tool_use.get("name", ""),
             "arguments": json.dumps(tool_use.get("input", {}))
         })
@@ -564,14 +843,13 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
 async def _handle_stream(kiro_request, headers, account, model, log_id, start_time):
     """流式处理 - Codex 期望的 SSE 格式"""
     
-    # 保存完整请求用于调试
-    import os
-    debug_dir = "debug_requests"
-    os.makedirs(debug_dir, exist_ok=True)
-    debug_file = f"{debug_dir}/{log_id}_request.json"
-    with open(debug_file, 'w', encoding='utf-8') as f:
-        json.dump(kiro_request, f, indent=2, ensure_ascii=False)
-    print(f"[Responses] Saved request to {debug_file}")
+    if _DEBUG_RESPONSES:
+        debug_dir = "debug_requests"
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = f"{debug_dir}/{log_id}_request.json"
+        with open(debug_file, "w", encoding="utf-8") as f:
+            json.dump(kiro_request, f, indent=2, ensure_ascii=False)
+        _debug(f"[Responses] Saved request to {debug_file}")
     
     async def generate():
         response_id = f"resp_{log_id}"
@@ -579,24 +857,23 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
         created_at = int(time.time())
         full_content = ""
         tool_uses = []
-        error_occurred = False
         
-        print(f"[Responses] Request: model={model}, log_id={log_id}")
+        _debug(f"[Responses] Request: model={model}, log_id={log_id}")
         
         try:
-            async with httpx.AsyncClient(verify=False, timeout=300) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=300) as client:
                 async with client.stream("POST", KIRO_API_URL, json=kiro_request, headers=headers) as response:
                     
                     if response.status_code != 200:
                         error_text = await response.aread()
                         error_msg = error_text.decode()[:500]
-                        print(f"[Responses] Kiro error: {response.status_code} - {error_msg[:200]}")
+                        _debug(f"[Responses] Kiro error: {response.status_code} - {error_msg[:200]}")
                         
                         # 打印更多调试信息
-                        if response.status_code == 400:
+                        if response.status_code == 400 and _DEBUG_RESPONSES:
                             cs = kiro_request.get("conversationState", {})
                             hist = cs.get("history", [])
-                            print(f"[Responses] 400 Debug: history_len={len(hist)}")
+                            _debug(f"[Responses] 400 Debug: history_len={len(hist)}")
                             if hist:
                                 # 检查每条 history 的详细结构
                                 for i, h in enumerate(hist[:5]):  # 只打印前5条
@@ -606,33 +883,31 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                         has_tr = has_ctx and "toolResults" in uim.get("userInputMessageContext", {})
                                         content_len = len(uim.get("content", ""))
                                         uim_keys = list(uim.keys())
-                                        print(f"[Responses]   hist[{i}]: user, keys={uim_keys}, content_len={content_len}, has_toolResults={has_tr}")
+                                        _debug(f"[Responses]   hist[{i}]: user, keys={uim_keys}, content_len={content_len}, has_toolResults={has_tr}")
                                     elif "assistantResponseMessage" in h:
                                         arm = h["assistantResponseMessage"]
                                         arm_keys = list(arm.keys())
                                         has_tu = "toolUses" in arm
                                         tu_count = len(arm.get("toolUses", []) or []) if has_tu else 0
                                         content_len = len(arm.get("content", "") or "")
-                                        print(f"[Responses]   hist[{i}]: assistant, keys={arm_keys}, content_len={content_len}, has_toolUses={has_tu}, toolUses_count={tu_count}")
+                                        _debug(f"[Responses]   hist[{i}]: assistant, keys={arm_keys}, content_len={content_len}, has_toolUses={has_tu}, toolUses_count={tu_count}")
                                     else:
-                                        print(f"[Responses]   hist[{i}]: UNKNOWN keys={list(h.keys())}")
+                                        _debug(f"[Responses]   hist[{i}]: UNKNOWN keys={list(h.keys())}")
                                 if len(hist) > 5:
-                                    print(f"[Responses]   ... ({len(hist) - 5} more)")
+                                    _debug(f"[Responses]   ... ({len(hist) - 5} more)")
                             
                             # 打印 currentMessage 结构
                             cm = cs.get("currentMessage", {})
                             if "userInputMessage" in cm:
                                 uim = cm["userInputMessage"]
-                                print(f"[Responses] currentMessage: keys={list(uim.keys())}, content_len={len(uim.get('content', ''))}")
+                                _debug(f"[Responses] currentMessage: keys={list(uim.keys())}, content_len={len(uim.get('content', ''))}")
                                 if "userInputMessageContext" in uim:
                                     ctx = uim["userInputMessageContext"]
-                                    print(f"[Responses]   context keys={list(ctx.keys())}")
+                                    _debug(f"[Responses]   context keys={list(ctx.keys())}")
                                     if "toolResults" in ctx:
-                                        print(f"[Responses]   toolResults count={len(ctx['toolResults'])}")
+                                        _debug(f"[Responses]   toolResults count={len(ctx['toolResults'])}")
                                     if "tools" in ctx:
-                                        print(f"[Responses]   tools count={len(ctx['tools'])}")
-                        
-                        error_occurred = True
+                                        _debug(f"[Responses]   tools count={len(ctx['tools'])}")
                         
                         # 映射错误代码
                         error_code = "api_error"
@@ -711,7 +986,6 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                     get_rate_limiter().record_request(account.id)
                     
         except Exception as e:
-            error_occurred = True
             yield _sse("response.failed", {
                 "type": "response.failed",
                 "response": {
@@ -795,7 +1069,7 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
 
 def _sse(event_type: str, data: dict) -> str:
     """生成 SSE 格式的事件"""
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _extract_content_from_chunk(chunk: bytes) -> str:

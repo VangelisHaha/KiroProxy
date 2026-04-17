@@ -13,6 +13,7 @@ from .config import MODELS_URL
 from .core import state, scheduler, stats_manager
 from .handlers import anthropic, openai, gemini, admin
 from .handlers import responses as responses_handler
+from .http_client import get_httpx_verify_setting
 from .web import get_html_page
 from .credential import generate_machine_id, get_kiro_version
 
@@ -81,7 +82,7 @@ async def models():
             "amz-sdk-invocation-id": str(uuid.uuid4()),
             "Authorization": f"Bearer {token}",
         }
-        async with httpx.AsyncClient(verify=False, timeout=30) as client:
+        async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=30) as client:
             resp = await client.get(MODELS_URL, headers=headers, params={"origin": "AI_EDITOR"})
             if resp.status_code == 200:
                 data = resp.json()

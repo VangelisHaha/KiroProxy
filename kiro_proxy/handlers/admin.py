@@ -13,6 +13,7 @@ from ..core import state, Account, stats_manager, get_browsers_info, open_url, f
 from ..credential import quota_manager, generate_machine_id, get_kiro_version, CredentialStatus
 from ..auth import start_device_flow, poll_device_flow, cancel_device_flow, get_login_state, save_credentials_to_file
 from ..auth import start_social_auth, exchange_social_auth_token, cancel_social_auth, get_social_auth_state
+from ..http_client import get_httpx_verify_setting
 
 
 async def get_status():
@@ -185,7 +186,7 @@ async def speedtest():
             "x-amz-user-agent": f"aws-sdk-js/1.0.0 KiroIDE-{kiro_version}-{machine_id}",
             "Authorization": f"Bearer {token}",
         }
-        async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=10) as client:
             resp = await client.get(MODELS_URL, headers=headers, params={"origin": "AI_EDITOR"})
             latency = (time.time() - start) * 1000
             return {
@@ -417,7 +418,7 @@ async def run_health_check():
                 "content-type": "application/json"
             }
             
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=10) as client:
                 resp = await client.get(
                     MODELS_URL,
                     headers=headers,

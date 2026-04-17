@@ -2,7 +2,6 @@
 import hashlib
 import platform
 import subprocess
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -42,29 +41,26 @@ def get_raw_machine_id() -> Optional[str]:
 
 
 def generate_machine_id(
-    profile_arn: Optional[str] = None, 
-    client_id: Optional[str] = None
+    profile_arn: Optional[str] = None,
+    client_id: Optional[str] = None,
+    uuid: Optional[str] = None,
 ) -> str:
     """生成基于凭证的唯一 Machine ID
     
-    每个凭证生成独立的 Machine ID，避免多账号共用同一指纹被检测。
-    优先级：profileArn > clientId > 系统硬件 ID
-    添加时间因子：按小时变化，避免指纹完全固化。
+    每个凭证生成独立且稳定的 Machine ID，避免多账号共用同一指纹。
+    优先级：uuid > profileArn > clientId > 系统硬件 ID
     """
-    unique_key = None
-    if profile_arn:
+    if uuid:
+        unique_key = uuid
+    elif profile_arn:
         unique_key = profile_arn
     elif client_id:
         unique_key = client_id
     else:
         unique_key = get_raw_machine_id() or "KIRO_DEFAULT_MACHINE"
-    
-    hour_slot = int(time.time()) // 3600
-    
+
     hasher = hashlib.sha256()
     hasher.update(unique_key.encode())
-    hasher.update(hour_slot.to_bytes(8, 'little'))
-    
     return hasher.hexdigest()
 
 

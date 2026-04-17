@@ -2,7 +2,7 @@
 
 增强版：参考 proxycast 实现
 - 工具数量限制（最多 50 个）
-- 工具描述截断（最多 500 字符）
+- 工具描述截断（提升至 9216 字符，兼容 Claude Code/Codex 长描述）
 - 历史消息交替修复
 - OpenAI tool 角色消息处理
 - tool_choice: required 支持
@@ -12,11 +12,15 @@
 import json
 import hashlib
 import re
+from collections import deque
 from typing import List, Dict, Any, Tuple, Optional
 
 # 常量
 MAX_TOOLS = 50
-MAX_TOOL_DESCRIPTION_LENGTH = 500
+MAX_TOOL_DESCRIPTION_LENGTH = 9216
+THINKING_MIN_BUDGET = 1024
+THINKING_MAX_BUDGET = 24576
+THINKING_DEFAULT_BUDGET = 20000
 
 
 def generate_session_id(messages: list) -> str:
@@ -92,6 +96,54 @@ def truncate_description(desc: str, max_length: int = MAX_TOOL_DESCRIPTION_LENGT
     if len(desc) <= max_length:
         return desc
     return desc[:max_length - 3] + "..."
+
+
+def _normalize_thinking_budget(budget_tokens: Any) -> int:
+    value = THINKING_DEFAULT_BUDGET
+    try:
+        parsed = int(budget_tokens)
+        if parsed > 0:
+            value = parsed
+    except Exception:
+        pass
+    if value < THINKING_MIN_BUDGET:
+        return THINKING_MIN_BUDGET
+    if value > THINKING_MAX_BUDGET:
+        return THINKING_MAX_BUDGET
+    return value
+
+
+def build_thinking_prefix(thinking: Any) -> str:
+    """将 thinking 配置映射为 Kiro 可识别前缀。"""
+    if not isinstance(thinking, dict):
+        return ""
+
+    thinking_type = str(thinking.get("type", "")).strip().lower()
+    if thinking_type == "enabled":
+        budget = _normalize_thinking_budget(thinking.get("budget_tokens"))
+        return f"<thinking_mode>enabled</thinking_mode><max_thinking_length>{budget}</max_thinking_length>"
+
+    if thinking_type == "adaptive":
+        effort = str(thinking.get("effort", "high")).strip().lower()
+        if effort not in {"low", "medium", "high"}:
+            effort = "high"
+        return f"<thinking_mode>adaptive</thinking_mode><thinking_effort>{effort}</thinking_effort>"
+
+    return ""
+
+
+def inject_thinking_prefix(system_text: str, thinking: Any) -> str:
+    """把 thinking 前缀注入 system 文本（避免重复注入）。"""
+    prefix = build_thinking_prefix(thinking)
+    if not prefix:
+        return system_text
+
+    if "<thinking_mode>" in system_text:
+        return system_text
+
+    if system_text:
+        return f"{prefix}\n{system_text}"
+    return prefix
 
 
 # ==================== Anthropic 转换 ====================
@@ -250,7 +302,11 @@ def fix_history_alternation(history: List[dict], model_id: str = "claude-sonnet-
     return fixed
 
 
-def convert_anthropic_messages_to_kiro(messages: List[dict], system="") -> Tuple[str, List[dict], List[dict]]:
+def convert_anthropic_messages_to_kiro(
+    messages: List[dict],
+    system="",
+    thinking: Optional[dict] = None,
+) -> Tuple[str, List[dict], List[dict]]:
     """将 Anthropic 消息格式转换为 Kiro 格式
     
     Returns:
@@ -271,6 +327,7 @@ def convert_anthropic_messages_to_kiro(messages: List[dict], system="") -> Tuple
         system_text = system_text.strip()
     elif isinstance(system, str):
         system_text = system
+    system_text = inject_thinking_prefix(system_text, thinking)
     
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
@@ -339,7 +396,13 @@ def convert_anthropic_messages_to_kiro(messages: List[dict], system="") -> Tuple
         
         if role == "user":
             if system_text and not history:
-                content = f"{system_text}\n\n{content}" if content else system_text
+                content_str = content if isinstance(content, str) else str(content or "")
+                # Claude Code 请求里可能把关键计费/路由头放在消息开头，
+                # 必须保留首行顺序，避免上游识别变化。
+                if content_str.lstrip().startswith("x-anthropic-billing-header:"):
+                    content = content_str
+                else:
+                    content = f"{system_text}\n\n{content_str}" if content_str else system_text
             
             if is_last:
                 user_content = content if content else "Continue"
@@ -475,7 +538,8 @@ def convert_openai_messages_to_kiro(
     messages: List[dict], 
     model: str,
     tools: List[dict] = None,
-    tool_choice = None
+    tool_choice = None,
+    thinking: Optional[dict] = None,
 ) -> Tuple[str, List[dict], List[dict], List[dict]]:
     """将 OpenAI 消息格式转换为 Kiro 格式
     
@@ -498,6 +562,7 @@ def convert_openai_messages_to_kiro(
     tool_instruction = ""
     if is_tool_choice_required(tool_choice) and tools:
         tool_instruction = "\n\n[CRITICAL INSTRUCTION] You MUST use one of the provided tools to respond. Do NOT respond with plain text. Call a tool function immediately."
+    thinking_prefix = build_thinking_prefix(thinking)
     
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
@@ -512,6 +577,8 @@ def convert_openai_messages_to_kiro(
         
         if role == "system":
             system_content = content + tool_instruction
+            if thinking_prefix:
+                system_content = f"{thinking_prefix}\n{system_content}" if system_content else thinking_prefix
         
         elif role == "tool":
             # OpenAI tool 角色消息 -> Kiro toolResults
@@ -676,7 +743,10 @@ def convert_kiro_response_to_openai(result: dict, model: str, msg_id: str) -> di
     }
     if tool_calls:
         message["tool_calls"] = tool_calls
-    
+
+    prompt_tokens = int(result.get("input_tokens", 0) or 0)
+    completion_tokens = int(result.get("output_tokens", 0) or 0)
+
     return {
         "id": msg_id,
         "object": "chat.completion",
@@ -687,9 +757,9 @@ def convert_kiro_response_to_openai(result: dict, model: str, msg_id: str) -> di
             "finish_reason": finish_reason
         }],
         "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 100,
-            "total_tokens": 200
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens
         }
     }
 
@@ -714,16 +784,34 @@ def convert_gemini_tools_to_kiro(tools: List[dict]) -> List[dict]:
     function_count = 0
     
     for tool in tools:
-        # Gemini 的工具定义在 functionDeclarations 中
-        declarations = tool.get("functionDeclarations", [])
+        if not isinstance(tool, dict):
+            continue
+        
+        # Gemini 原生联网工具（统一映射为 Kiro web_search）
+        if any(k in tool for k in ("googleSearch", "googleSearchRetrieval", "webSearch", "urlContext")):
+            kiro_tools.append({"webSearchTool": {"type": "web_search"}})
+            continue
+        
+        # Gemini 工具定义可能是 camelCase 或 snake_case
+        declarations = (
+            tool.get("functionDeclarations")
+            or tool.get("function_declarations")
+            or []
+        )
         
         for func in declarations:
+            if not isinstance(func, dict):
+                continue
+            
             # 限制工具数量
             if function_count >= MAX_TOOLS:
                 break
-            function_count += 1
             
             name = func.get("name", "")
+            if not name:
+                continue
+            
+            function_count += 1
             description = func.get("description", f"Tool: {name}")
             description = truncate_description(description)
             parameters = func.get("parameters", {"type": "object", "properties": {}})
@@ -741,13 +829,185 @@ def convert_gemini_tools_to_kiro(tools: List[dict]) -> List[dict]:
     return kiro_tools
 
 
+def _convert_gemini_inline_image_to_kiro(part: dict) -> Optional[dict]:
+    """将 Gemini inlineData 图片转换为 Kiro 图片格式"""
+    inline_data = part.get("inlineData")
+    if not isinstance(inline_data, dict):
+        return None
+    
+    mime_type = str(inline_data.get("mimeType", "")).lower()
+    data = inline_data.get("data")
+    
+    if not (isinstance(data, str) and data):
+        return None
+    if not mime_type.startswith("image/"):
+        return None
+    
+    image_format = mime_type.split("/", 1)[1].split(";", 1)[0] or "jpeg"
+    return {
+        "format": image_format,
+        "source": {"bytes": data},
+    }
+
+
+def _gemini_inline_data_note(inline_data: dict) -> str:
+    """将 Gemini inlineData 转换为可读描述（用于工具结果文本化）"""
+    mime_type = inline_data.get("mimeType", "application/octet-stream")
+    return f"[Inline data: ({mime_type})]"
+
+
+def _gemini_file_data_note(file_data: dict) -> str:
+    """将 Gemini fileData 转换为可读描述（用于文本化）"""
+    file_uri = file_data.get("fileUri")
+    mime_type = file_data.get("mimeType", "application/octet-stream")
+    if file_uri:
+        return f"[Attached file: {file_uri} ({mime_type})]"
+    return f"[Attached file: ({mime_type})]"
+
+
+def _dedupe_text_lines(lines: List[str]) -> List[str]:
+    """按出现顺序去重文本行"""
+    seen = set()
+    unique = []
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        if not line.strip():
+            continue
+        dedupe_key = line.strip()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        unique.append(line)
+    return unique
+
+
+def _extract_text_from_gemini_payload(payload: Any, depth: int = 0) -> List[str]:
+    """尽量从 Gemini payload 中提取文本信息，包含多模态描述"""
+    if depth > 5:
+        return []
+    
+    if payload is None:
+        return []
+    if isinstance(payload, str):
+        return [payload] if payload else []
+    if isinstance(payload, (int, float, bool)):
+        return [json.dumps(payload, ensure_ascii=False)]
+    if isinstance(payload, list):
+        lines = []
+        for item in payload:
+            lines.extend(_extract_text_from_gemini_payload(item, depth + 1))
+        return lines
+    if isinstance(payload, dict):
+        lines = []
+        
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            lines.append(text)
+        
+        inline_data = payload.get("inlineData") or payload.get("inline_data")
+        if isinstance(inline_data, dict):
+            lines.append(_gemini_inline_data_note(inline_data))
+        
+        file_data = payload.get("fileData") or payload.get("file_data")
+        if isinstance(file_data, dict):
+            lines.append(_gemini_file_data_note(file_data))
+        
+        # 常见结构字段（函数输出/工具响应/多模态嵌套）
+        for key in ("output", "content", "parts", "data", "message", "result", "error"):
+            if key in payload:
+                lines.extend(_extract_text_from_gemini_payload(payload.get(key), depth + 1))
+        
+        if lines:
+            return lines
+        
+        try:
+            return [json.dumps(payload, ensure_ascii=False)]
+        except Exception:
+            return [str(payload)]
+    
+    return [str(payload)]
+
+
+def _extract_gemini_function_response(fr: dict) -> Tuple[str, str]:
+    """提取 Gemini functionResponse 的文本和状态"""
+    response = fr.get("response")
+    status = "success"
+    
+    if fr.get("isError") is True or fr.get("is_error") is True or fr.get("error"):
+        status = "error"
+    
+    if isinstance(response, dict):
+        if (
+            response.get("success") is False
+            or response.get("isError") is True
+            or response.get("is_error") is True
+            or response.get("error")
+        ):
+            status = "error"
+    
+    text_lines = _extract_text_from_gemini_payload(response)
+    if "parts" in fr:
+        text_lines.extend(_extract_text_from_gemini_payload(fr.get("parts")))
+    
+    output_text = "\n".join(_dedupe_text_lines(text_lines))
+    if not output_text:
+        output_text = "Tool execution completed."
+    
+    return output_text, status
+
+
+def _dedupe_tool_results(results: List[dict]) -> List[dict]:
+    """按 toolUseId 去重并合并内容"""
+    merged: Dict[str, dict] = {}
+    ordered: List[dict] = []
+    
+    for tr in results:
+        tool_use_id = tr.get("toolUseId")
+        if not tool_use_id:
+            continue
+        
+        new_text = ""
+        content = tr.get("content", [])
+        if isinstance(content, list) and content and isinstance(content[0], dict):
+            new_text = str(content[0].get("text", ""))
+        
+        new_status = "error" if tr.get("status") == "error" else "success"
+        
+        if tool_use_id not in merged:
+            normalized = {
+                "content": [{"text": new_text if new_text else "Tool execution completed."}],
+                "status": new_status,
+                "toolUseId": tool_use_id
+            }
+            merged[tool_use_id] = normalized
+            ordered.append(normalized)
+            continue
+        
+        existing = merged[tool_use_id]
+        existing_text = ""
+        existing_content = existing.get("content", [])
+        if isinstance(existing_content, list) and existing_content and isinstance(existing_content[0], dict):
+            existing_text = str(existing_content[0].get("text", ""))
+        
+        if new_text:
+            merged_lines = _dedupe_text_lines([existing_text, new_text])
+            existing["content"] = [{"text": "\n".join(merged_lines)}]
+        
+        if new_status == "error":
+            existing["status"] = "error"
+    
+    return ordered
+
+
 def convert_gemini_contents_to_kiro(
     contents: List[dict], 
     system_instruction: dict, 
     model: str,
     tools: List[dict] = None,
-    tool_config: dict = None
-) -> Tuple[str, List[dict], List[dict], List[dict]]:
+    tool_config: dict = None,
+    thinking_config: Optional[dict] = None,
+) -> Tuple[str, List[dict], List[dict], List[dict], List[dict]]:
     """将 Gemini 消息格式转换为 Kiro 格式
     
     增强：
@@ -755,131 +1015,199 @@ def convert_gemini_contents_to_kiro(
     - 支持 tool_config
     
     Returns:
-        (user_content, history, tool_results, kiro_tools)
+        (user_content, history, tool_results, kiro_tools, images)
     """
     history = []
     user_content = ""
     current_tool_results = []
-    pending_tool_results = []
+    current_images = []
+    pending_call_ids = deque()
+    pending_call_ids_by_name: Dict[str, deque] = {}
+    consumed_call_ids = set()
+    
+    def remember_call_id(call_name: str, call_id: str):
+        pending_call_ids.append(call_id)
+        if call_name:
+            pending_call_ids_by_name.setdefault(call_name, deque()).append(call_id)
+    
+    def consume_call_id(call_name: str, explicit_id: str = "") -> Optional[str]:
+        if explicit_id:
+            consumed_call_ids.add(explicit_id)
+            return explicit_id
+        
+        if call_name:
+            queue = pending_call_ids_by_name.get(call_name)
+            if queue:
+                while queue and queue[0] in consumed_call_ids:
+                    queue.popleft()
+                if queue:
+                    call_id = queue.popleft()
+                    consumed_call_ids.add(call_id)
+                    return call_id
+        
+        while pending_call_ids and pending_call_ids[0] in consumed_call_ids:
+            pending_call_ids.popleft()
+        if pending_call_ids:
+            call_id = pending_call_ids.popleft()
+            consumed_call_ids.add(call_id)
+            return call_id
+        return None
     
     # 处理 system instruction
     system_text = ""
     if system_instruction:
-        parts = system_instruction.get("parts", [])
-        system_text = " ".join(p.get("text", "") for p in parts if "text" in p)
+        if isinstance(system_instruction, str):
+            system_text = system_instruction
+        elif isinstance(system_instruction, dict):
+            parts = system_instruction.get("parts", [])
+            if isinstance(parts, list):
+                system_text = " ".join(
+                    p.get("text", "") for p in parts
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                )
+    normalized_thinking = thinking_config if isinstance(thinking_config, dict) else None
+    if normalized_thinking and "type" not in normalized_thinking:
+        if normalized_thinking.get("includeThoughts") is True or normalized_thinking.get("thinkingBudget") is not None:
+            normalized_thinking = {
+                "type": "enabled",
+                "budget_tokens": normalized_thinking.get("thinkingBudget"),
+            }
+        else:
+            normalized_thinking = None
+    system_text = inject_thinking_prefix(system_text, normalized_thinking)
     
     # 处理 tool_config（类似 tool_choice）
     tool_instruction = ""
-    if tool_config:
-        mode = tool_config.get("functionCallingConfig", {}).get("mode", "")
-        if mode in ("ANY", "REQUIRED"):
-            tool_instruction = "\n\n[CRITICAL INSTRUCTION] You MUST use one of the provided tools to respond. Do NOT respond with plain text."
+    function_calling_config = {}
+    if isinstance(tool_config, dict):
+        function_calling_config = (
+            tool_config.get("functionCallingConfig")
+            or tool_config.get("function_calling_config")
+            or {}
+        )
+    mode = str(function_calling_config.get("mode", "")).upper()
+    if mode in ("ANY", "REQUIRED"):
+        tool_instruction = "\n\n[CRITICAL INSTRUCTION] You MUST use one of the provided tools to respond. Do NOT respond with plain text."
+        allowed_names = function_calling_config.get("allowedFunctionNames") or function_calling_config.get("allowed_function_names")
+        if isinstance(allowed_names, list) and allowed_names:
+            tool_instruction += f"\nAllowed tools: {', '.join(str(n) for n in allowed_names)}"
+    
+    system_attached = False
     
     for i, content in enumerate(contents):
+        if not isinstance(content, dict):
+            continue
+        
         role = content.get("role", "user")
         parts = content.get("parts", [])
         is_last = (i == len(contents) - 1)
+        if not isinstance(parts, list):
+            parts = [parts] if parts else []
         
         # 提取文本和工具调用
         text_parts = []
         tool_calls = []
         tool_responses = []
+        images = []
         
-        for part in parts:
-            if "text" in part:
+        for part_index, part in enumerate(parts):
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            
+            if isinstance(part.get("text"), str):
                 text_parts.append(part["text"])
-            elif "functionCall" in part:
+            
+            inline_image = _convert_gemini_inline_image_to_kiro(part)
+            if inline_image:
+                images.append(inline_image)
+            
+            if "fileData" in part and isinstance(part.get("fileData"), dict):
+                file_data = part.get("fileData", {})
+                text_parts.append(_gemini_file_data_note(file_data))
+            
+            function_call = part.get("functionCall")
+            if not isinstance(function_call, dict):
+                function_call = part.get("function_call")
+            
+            if isinstance(function_call, dict):
                 # Gemini 的工具调用
-                fc = part["functionCall"]
+                fc = function_call
+                fc_name = str(fc.get("name", "") or "").strip()
+                fc_id = str(fc.get("id") or f"{fc_name or 'tool'}_{i}_{part_index}")
+                fc_args = fc.get("args", {})
+                if isinstance(fc_args, str):
+                    try:
+                        parsed_args = json.loads(fc_args)
+                        fc_args = parsed_args if isinstance(parsed_args, dict) else {"input": parsed_args}
+                    except Exception:
+                        fc_args = {"input": fc_args}
+                elif not isinstance(fc_args, dict):
+                    fc_args = {"input": fc_args}
+                
+                remember_call_id(fc_name, fc_id)
+                
                 tool_calls.append({
-                    "toolUseId": fc.get("name", "") + "_" + str(i),  # Gemini 没有 ID，生成一个
-                    "name": fc.get("name", ""),
-                    "input": fc.get("args", {})
+                    "toolUseId": fc_id,
+                    "name": fc_name,
+                    "input": fc_args
                 })
-            elif "functionResponse" in part:
+                continue
+            
+            function_response = part.get("functionResponse")
+            if not isinstance(function_response, dict):
+                function_response = part.get("function_response")
+            
+            if isinstance(function_response, dict):
                 # Gemini 的工具响应
-                fr = part["functionResponse"]
-                response_content = fr.get("response", {})
-                if isinstance(response_content, dict):
-                    response_text = json.dumps(response_content)
-                else:
-                    response_text = str(response_content)
+                fr = function_response
+                fr_name = str(fr.get("name", "") or "").strip()
+                fr_id = str(fr.get("id") or "")
+                call_id = consume_call_id(fr_name, fr_id) or f"{fr_name or 'tool'}_{i}_{part_index}"
+                response_text, status = _extract_gemini_function_response(fr)
                 
                 tool_responses.append({
                     "content": [{"text": response_text}],
-                    "status": "success",
-                    "toolUseId": fr.get("name", "") + "_" + str(i - 1)  # 匹配上一个调用
+                    "status": status,
+                    "toolUseId": call_id
                 })
         
-        text = " ".join(text_parts)
+        text = "\n".join([t for t in text_parts if isinstance(t, str) and t])
         
         if role == "user":
-            # 处理待处理的 tool responses
-            if pending_tool_results:
-                seen_ids = set()
-                unique_results = []
-                for tr in pending_tool_results:
-                    if tr["toolUseId"] not in seen_ids:
-                        seen_ids.add(tr["toolUseId"])
-                        unique_results.append(tr)
-                
-                history.append({
-                    "userInputMessage": {
-                        "content": "Tool results provided.",
-                        "modelId": model,
-                        "origin": "AI_EDITOR",
-                        "userInputMessageContext": {
-                            "toolResults": unique_results
-                        }
-                    }
-                })
-                pending_tool_results = []
-            
-            # 处理 functionResponse（用户消息中的工具响应）
-            if tool_responses:
-                pending_tool_results.extend(tool_responses)
-            
             # 合并 system prompt
-            if system_text and not history:
-                text = f"{system_text}{tool_instruction}\n\n{text}"
+            if (system_text or tool_instruction) and not system_attached:
+                system_prefix = f"{system_text}{tool_instruction}".strip()
+                text = f"{system_prefix}\n\n{text}" if text else system_prefix
+                system_attached = True
+            
+            if images and not is_last:
+                image_note = f"[User attached {len(images)} image(s)]"
+                text = f"{text}\n{image_note}" if text else image_note
+            
+            tool_responses = _dedupe_tool_results(tool_responses)
             
             if is_last:
-                user_content = text
-                if pending_tool_results:
-                    current_tool_results = pending_tool_results
-                    pending_tool_results = []
+                user_content = text if text else ("Tool results provided." if tool_responses else "Continue")
+                current_tool_results = tool_responses
+                current_images = images
             else:
-                if text:
-                    history.append({
-                        "userInputMessage": {
-                            "content": text,
-                            "modelId": model,
-                            "origin": "AI_EDITOR"
-                        }
-                    })
+                user_msg = {
+                    "userInputMessage": {
+                        "content": text if text else ("Tool results provided." if tool_responses else "Continue"),
+                        "modelId": model,
+                        "origin": "AI_EDITOR"
+                    }
+                }
+                if tool_responses:
+                    user_msg["userInputMessage"]["userInputMessageContext"] = {
+                        "toolResults": tool_responses
+                    }
+                history.append(user_msg)
         
         elif role == "model":
-            # 处理待处理的 tool responses
-            if pending_tool_results:
-                seen_ids = set()
-                unique_results = []
-                for tr in pending_tool_results:
-                    if tr["toolUseId"] not in seen_ids:
-                        seen_ids.add(tr["toolUseId"])
-                        unique_results.append(tr)
-                
-                history.append({
-                    "userInputMessage": {
-                        "content": "Tool results provided.",
-                        "modelId": model,
-                        "origin": "AI_EDITOR",
-                        "userInputMessageContext": {
-                            "toolResults": unique_results
-                        }
-                    }
-                })
-                pending_tool_results = []
-            
             assistant_text = text if text else "I understand."
             
             assistant_msg = {
@@ -893,31 +1221,24 @@ def convert_gemini_contents_to_kiro(
             
             history.append(assistant_msg)
     
-    # 处理末尾的 tool results
-    if pending_tool_results:
-        current_tool_results = pending_tool_results
-        if not user_content:
-            user_content = "Tool results provided."
-    
     # 如果没有用户消息
     if not user_content:
         if contents:
             last_parts = contents[-1].get("parts", [])
-            user_content = " ".join(p.get("text", "") for p in last_parts if "text" in p)
+            user_content = " ".join(
+                p.get("text", "") for p in last_parts
+                if isinstance(p, dict) and "text" in p
+            )
         if not user_content:
             user_content = "Continue"
     
     # 修复历史交替
     history = fix_history_alternation(history, model)
     
-    # 移除最后一条（当前用户消息）
-    if history and "userInputMessage" in history[-1]:
-        history = history[:-1]
-    
     # 转换工具
     kiro_tools = convert_gemini_tools_to_kiro(tools) if tools else []
     
-    return user_content, history, current_tool_results, kiro_tools
+    return user_content, history, current_tool_results, kiro_tools, current_images
 
 
 def convert_kiro_response_to_gemini(result: dict, model: str) -> dict:
@@ -934,20 +1255,28 @@ def convert_kiro_response_to_gemini(result: dict, model: str) -> dict:
     # 添加工具调用
     for tool_use in tool_uses:
         if tool_use.get("type") == "tool_use":
+            function_call = {
+                "name": tool_use.get("name", ""),
+                "args": tool_use.get("input", {})
+            }
+            if tool_use.get("id"):
+                function_call["id"] = tool_use.get("id")
             parts.append({
-                "functionCall": {
-                    "name": tool_use.get("name", ""),
-                    "args": tool_use.get("input", {})
-                }
+                "functionCall": function_call
             })
     
     # 映射 stop_reason
-    stop_reason = result.get("stop_reason", "STOP")
+    stop_reason = str(result.get("stop_reason", "")).lower()
     finish_reason = "STOP"
-    if tool_uses:
-        finish_reason = "TOOL_CALLS"
-    elif stop_reason == "max_tokens":
+    if stop_reason == "max_tokens":
         finish_reason = "MAX_TOKENS"
+    elif stop_reason in ("safety", "content_filter"):
+        finish_reason = "SAFETY"
+    elif stop_reason in ("recitation",):
+        finish_reason = "RECITATION"
+    
+    prompt_tokens = int(result.get("input_tokens", 0) or 0)
+    candidate_tokens = int(result.get("output_tokens", 0) or 0)
     
     return {
         "candidates": [{
@@ -959,8 +1288,8 @@ def convert_kiro_response_to_gemini(result: dict, model: str) -> dict:
             "index": 0
         }],
         "usageMetadata": {
-            "promptTokenCount": 100,
-            "candidatesTokenCount": 100,
-            "totalTokenCount": 200
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": candidate_tokens,
+            "totalTokenCount": prompt_tokens + candidate_tokens
         }
     }

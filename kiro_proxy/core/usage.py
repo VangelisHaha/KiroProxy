@@ -7,6 +7,8 @@ import httpx
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from ..http_client import get_httpx_verify_setting
+
 
 # API 端点
 USAGE_LIMITS_URL = "https://q.us-east-1.amazonaws.com/getUsageLimits"
@@ -146,7 +148,7 @@ async def get_usage_limits(
     headers = build_usage_headers(access_token, machine_id, kiro_version)
     
     try:
-        async with httpx.AsyncClient(timeout=10, verify=False) as client:
+        async with httpx.AsyncClient(timeout=10, verify=get_httpx_verify_setting()) as client:
             response = await client.get(url, headers=headers)
             
             if response.status_code != 200:

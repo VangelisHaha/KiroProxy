@@ -5,6 +5,7 @@ from typing import Tuple
 
 from .types import KiroCredentials
 from .fingerprint import generate_machine_id, get_kiro_version
+from ..http_client import get_httpx_verify_setting
 
 
 class TokenRefresher:
@@ -12,14 +13,26 @@ class TokenRefresher:
     
     def __init__(self, credentials: KiroCredentials):
         self.credentials = credentials
+
+    def _resolve_auth_method(self) -> str:
+        method = (self.credentials.auth_method or "").strip().lower()
+        if method in {"idc", "builder-id", "builder_id"}:
+            return "idc"
+        if method == "social":
+            return "social"
+        # 兼容旧 token：缺失 authMethod 时按字段推断
+        if self.credentials.client_id and self.credentials.client_secret:
+            return "idc"
+        return "social"
     
     def get_refresh_url(self) -> str:
         """获取刷新 URL"""
-        region = self.credentials.region or "us-east-1"
-        auth_method = (self.credentials.auth_method or "social").lower()
+        auth_method = self._resolve_auth_method()
+        region = (self.credentials.region or "us-east-1").strip()
+        idc_region = (self.credentials.idc_region or self.credentials.region or "us-east-1").strip()
         
         if auth_method == "idc":
-            return f"https://oidc.{region}.amazonaws.com/token"
+            return f"https://oidc.{idc_region}.amazonaws.com/token"
         else:
             return f"https://prod.{region}.auth.desktop.kiro.dev/refreshToken"
     
@@ -41,8 +54,9 @@ class TokenRefresher:
     def _get_machine_id(self) -> str:
         """获取 Machine ID"""
         return generate_machine_id(
-            self.credentials.profile_arn, 
-            self.credentials.client_id
+            profile_arn=self.credentials.profile_arn,
+            client_id=self.credentials.client_id,
+            uuid=getattr(self.credentials, "uuid", None),
         )
     
     async def refresh(self) -> Tuple[bool, str]:
@@ -52,13 +66,14 @@ class TokenRefresher:
             return False, error
         
         refresh_url = self.get_refresh_url()
-        auth_method = (self.credentials.auth_method or "social").lower()
+        auth_method = self._resolve_auth_method()
+        self.credentials.auth_method = auth_method
         
         machine_id = self._get_machine_id()
         kiro_version = get_kiro_version()
         
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30) as client:
+            async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=30) as client:
                 if auth_method == "idc":
                     if not self.credentials.client_id or not self.credentials.client_secret:
                         return False, "IdC 认证缺少 client_id 或 client_secret"
@@ -93,7 +108,10 @@ class TokenRefresher:
                     else:
                         return False, f"刷新失败: {resp.status_code} - {error_text[:200]}"
                 
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    return False, f"刷新响应不是 JSON: {resp.text[:200]}"
                 
                 new_token = data.get("accessToken") or data.get("access_token")
                 if not new_token:

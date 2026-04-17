@@ -1,5 +1,6 @@
 """Kiro Provider"""
 import json
+import re
 import uuid
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -35,8 +36,9 @@ class KiroProvider(BaseProvider):
         
         if self.credentials:
             self._machine_id = generate_machine_id(
-                self.credentials.profile_arn,
-                self.credentials.client_id
+                profile_arn=self.credentials.profile_arn,
+                client_id=self.credentials.client_id,
+                uuid=getattr(self.credentials, "uuid", None),
             )
         else:
             self._machine_id = generate_machine_id()
@@ -79,6 +81,10 @@ class KiroProvider(BaseProvider):
     ) -> Dict[str, Any]:
         """构建 Kiro API 请求体"""
         conversation_id = str(uuid.uuid4())
+        history = self._normalize_history(history or [], model)
+        clean_tools = [t for t in (tools or []) if isinstance(t, dict)]
+        clean_tool_results = self._dedupe_tool_results(tool_results or [])
+        clean_images = [img for img in (images or []) if isinstance(img, dict)]
         
         # 确保 content 不为空
         if not user_content:
@@ -90,29 +96,117 @@ class KiroProvider(BaseProvider):
             "origin": "AI_EDITOR",
         }
         
-        if images:
-            user_input_message["images"] = images
+        if clean_images:
+            user_input_message["images"] = clean_images
         
         # 只有在有 tools 或 tool_results 时才添加 userInputMessageContext
         context = {}
-        if tools:
-            context["tools"] = tools
-        if tool_results:
-            context["toolResults"] = tool_results
+        if clean_tools:
+            context["tools"] = clean_tools
+        if clean_tool_results:
+            context["toolResults"] = clean_tool_results
         
         if context:
             user_input_message["userInputMessageContext"] = context
         
-        return {
-            "conversationState": {
-                "agentContinuationId": str(uuid.uuid4()),
-                "agentTaskType": "vibe",
-                "chatTriggerType": "MANUAL",
-                "conversationId": conversation_id,
-                "currentMessage": {"userInputMessage": user_input_message},
-                "history": history or []
-            }
+        conversation_state = {
+            "agentContinuationId": str(uuid.uuid4()),
+            "agentTaskType": "vibe",
+            "chatTriggerType": "MANUAL",
+            "conversationId": conversation_id,
+            "currentMessage": {"userInputMessage": user_input_message},
         }
+        if history:
+            conversation_state["history"] = history
+        
+        payload = {
+            "conversationState": conversation_state
+        }
+        
+        # 新版 Kiro API 要求 profileArn 位于顶层字段。
+        # 同时保留 conversationState 内部字段以兼容旧行为。
+        if self.credentials and self.credentials.profile_arn:
+            conversation_state["profileArn"] = self.credentials.profile_arn
+            payload["profileArn"] = self.credentials.profile_arn
+        
+        return payload
+
+    @staticmethod
+    def _dedupe_tool_results(tool_results: List[dict]) -> List[dict]:
+        deduped: List[dict] = []
+        seen = set()
+        for item in tool_results:
+            if not isinstance(item, dict):
+                continue
+            tool_use_id = item.get("toolUseId")
+            if not tool_use_id or tool_use_id in seen:
+                continue
+            seen.add(tool_use_id)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _normalize_history(history: List[dict], model: str) -> List[dict]:
+        """兜底修正 history，避免上游因结构异常拒绝请求。"""
+        fixed: List[dict] = []
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            if "userInputMessage" in msg and isinstance(msg["userInputMessage"], dict):
+                user_msg = dict(msg["userInputMessage"])
+                if not user_msg.get("content"):
+                    user_msg["content"] = "Continue"
+                user_msg.setdefault("modelId", model)
+                user_msg.setdefault("origin", "AI_EDITOR")
+                normalized = {"userInputMessage": user_msg}
+            elif "assistantResponseMessage" in msg and isinstance(msg["assistantResponseMessage"], dict):
+                assistant_msg = dict(msg["assistantResponseMessage"])
+                if not assistant_msg.get("content"):
+                    assistant_msg["content"] = "I understand."
+                normalized = {"assistantResponseMessage": assistant_msg}
+            else:
+                continue
+
+            # 合并连续同角色消息，降低 Kiro 拒绝概率。
+            if fixed:
+                last = fixed[-1]
+                if "userInputMessage" in last and "userInputMessage" in normalized:
+                    prev = last["userInputMessage"]
+                    cur = normalized["userInputMessage"]
+                    prev["content"] = f"{prev.get('content', '')}\n{cur.get('content', '')}".strip() or "Continue"
+                    cur_ctx = cur.get("userInputMessageContext", {})
+                    if isinstance(cur_ctx, dict) and cur_ctx.get("toolResults"):
+                        prev_ctx = prev.setdefault("userInputMessageContext", {})
+                        prev_ctx.setdefault("toolResults", [])
+                        prev_ctx["toolResults"].extend(cur_ctx["toolResults"])
+                    continue
+                if "assistantResponseMessage" in last and "assistantResponseMessage" in normalized:
+                    prev = last["assistantResponseMessage"]
+                    cur = normalized["assistantResponseMessage"]
+                    prev["content"] = f"{prev.get('content', '')}\n{cur.get('content', '')}".strip() or "I understand."
+                    if cur.get("toolUses"):
+                        prev.setdefault("toolUses", [])
+                        prev["toolUses"].extend(cur.get("toolUses") or [])
+                    continue
+
+            fixed.append(normalized)
+        return fixed
+
+    @staticmethod
+    def _iter_json_objects_from_text(raw_text: str):
+        decoder = json.JSONDecoder()
+        idx = 0
+        n = len(raw_text)
+        while idx < n:
+            start = raw_text.find("{", idx)
+            if start < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(raw_text, start)
+                yield obj
+                idx = end
+            except Exception:
+                idx = start + 1
     
     def parse_response(self, raw: bytes) -> Dict[str, Any]:
         """解析 AWS event-stream 格式响应"""
@@ -183,6 +277,32 @@ class KiroProvider(BaseProvider):
                     pass
             
             pos += total_len
+
+        # 某些代理链路会破坏 AWS event-stream 头；回退为文本 JSON 扫描。
+        if not result["content"] and not tool_input_buffer:
+            raw_text = raw.decode("utf-8", errors="ignore")
+            for payload in self._iter_json_objects_from_text(raw_text):
+                if not isinstance(payload, dict):
+                    continue
+                if "assistantResponseEvent" in payload and isinstance(payload["assistantResponseEvent"], dict):
+                    content = payload["assistantResponseEvent"].get("content")
+                    if content:
+                        result["content"].append(str(content))
+                elif "content" in payload and not payload.get("toolUseId"):
+                    content = payload.get("content")
+                    if content:
+                        result["content"].append(str(content))
+
+                if payload.get("toolUseId"):
+                    tool_id = payload.get("toolUseId", "")
+                    if not tool_id:
+                        continue
+                    if tool_id not in tool_input_buffer:
+                        tool_input_buffer[tool_id] = {"id": tool_id, "name": "", "input_parts": []}
+                    if payload.get("name"):
+                        tool_input_buffer[tool_id]["name"] = payload["name"]
+                    if payload.get("input"):
+                        tool_input_buffer[tool_id]["input_parts"].append(str(payload["input"]))
         
         # 组装工具调用
         for tool_id, tool_data in tool_input_buffer.items():
@@ -201,6 +321,10 @@ class KiroProvider(BaseProvider):
         
         if result["tool_uses"]:
             result["stop_reason"] = "tool_use"
+        elif result["content"]:
+            text = "".join(result["content"])
+            if re.search(r"\bmax[_-]?tokens\b", text, flags=re.IGNORECASE):
+                result["stop_reason"] = "max_tokens"
         
         return result
     

@@ -3,6 +3,8 @@ import asyncio
 from typing import Optional
 from datetime import datetime
 
+from ..http_client import get_httpx_verify_setting
+
 
 class BackgroundScheduler:
     """后台任务调度器
@@ -99,7 +101,7 @@ class BackgroundScheduler:
                     "content-type": "application/json"
                 }
                 
-                async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=10) as client:
                     resp = await client.get(
                         MODELS_URL, 
                         headers=headers,

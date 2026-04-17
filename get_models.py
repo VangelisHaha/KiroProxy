@@ -5,6 +5,7 @@ import json
 import uuid
 import httpx
 from pathlib import Path
+from kiro_proxy.http_client import get_httpx_verify_setting
 
 TOKEN_PATH = Path.home() / ".aws/sso/cache/kiro-auth-token.json"
 MACHINE_ID = "fa41d5def91e29225c73f6ea8ee0941a87bd812aae5239e3dde72c3ba7603a26"
@@ -26,7 +27,7 @@ def get_models():
     # 尝试不同的参数
     params = {"origin": "AI_EDITOR"}
     
-    with httpx.Client(verify=False, timeout=30) as client:
+    with httpx.Client(verify=get_httpx_verify_setting(), timeout=30) as client:
         resp = client.get(MODELS_URL, headers=headers, params=params)
         print(f"Status: {resp.status_code}")
         print(f"Headers: {dict(resp.headers)}")
