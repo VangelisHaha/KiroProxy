@@ -1,4 +1,4 @@
-"""Anthropic 协议处理 - /v1/messages"""
+"""Anthropic protocol handler - /v1/messages."""
 import json
 import uuid
 import time
@@ -15,7 +15,7 @@ from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
 from ..core.auth_guard import ensure_profile_arn_ready
 from ..credential import quota_manager
-from ..http_client import get_httpx_verify_setting
+from ..http_client import get_httpx_verify_setting, create_async_client
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream_full, parse_event_stream, is_quota_exceeded_error
 from ..converters import (
     generate_session_id,
@@ -24,6 +24,11 @@ from ..converters import (
     convert_kiro_response_to_anthropic,
     extract_images_from_content
 )
+from ..payload_guards import guard_payload
+from ..tokenizer import count_tokens, count_message_tokens
+from ..logger import get_logger
+
+logger = get_logger("anthropic")
 
 
 def _extract_text_from_content(content) -> str:
@@ -45,9 +50,8 @@ def _extract_text_from_content(content) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
+    """Estimate token count using tiktoken-based tokenizer."""
+    return count_tokens(text)
 
 
 def _count_tokens_from_messages(messages, system: str = "") -> int:
@@ -214,9 +218,15 @@ async def handle_messages(request: Request):
         if last_msg.get("role") == "user":
             _, images = extract_images_from_content(last_msg.get("content", ""))
     
-    # 构建 Kiro 请求
+    # Build Kiro request
     kiro_tools = convert_anthropic_tools_to_kiro(tools) if tools else None
     kiro_request = build_kiro_request(user_content, model, history, kiro_tools, images, tool_results, creds)
+    
+    # Payload size guard
+    payload_error = guard_payload(kiro_request)
+    if payload_error:
+        logger.warning(f"Payload guard: {payload_error}")
+        raise HTTPException(400, payload_error)
     
     if stream:
         return await _handle_stream(kiro_request, headers, account, model, log_id, start_time, session_id, flow_id, history, user_content, kiro_tools, images, tool_results, history_manager)

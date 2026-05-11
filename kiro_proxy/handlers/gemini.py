@@ -1,4 +1,4 @@
-"""Gemini 协议处理 - /v1/models/{model}:generateContent"""
+"""Gemini protocol handler - /v1/models/{model}:generateContent."""
 import json
 import uuid
 import time
@@ -14,9 +14,13 @@ from ..core.history_manager import HistoryManager, get_history_config, is_conten
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
 from ..core.auth_guard import ensure_profile_arn_ready
-from ..http_client import get_httpx_verify_setting
+from ..http_client import get_httpx_verify_setting, create_async_client
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
 from ..converters import convert_gemini_contents_to_kiro, convert_kiro_response_to_gemini, convert_gemini_tools_to_kiro
+from ..payload_guards import guard_payload
+from ..logger import get_logger
+
+logger = get_logger("gemini")
 
 
 async def handle_generate_content(model_name: str, request: Request):
@@ -110,7 +114,7 @@ async def handle_generate_content(model_name: str, request: Request):
     if history_manager.was_truncated:
         print(f"[Gemini] {history_manager.truncate_info}")
     
-    # 构建 Kiro 请求
+    # Build Kiro request
     kiro_request = build_kiro_request(
         user_content, model, history,
         images=images,
@@ -118,6 +122,12 @@ async def handle_generate_content(model_name: str, request: Request):
         tool_results=tool_results if tool_results else None,
         credentials=creds
     )
+    
+    # Payload size guard
+    payload_error = guard_payload(kiro_request)
+    if payload_error:
+        logger.warning(f"Payload guard: {payload_error}")
+        return {"error": {"code": 400, "message": payload_error, "status": "INVALID_ARGUMENT"}}
     
     error_msg = None
     status_code = 200
