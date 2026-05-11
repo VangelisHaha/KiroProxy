@@ -1,4 +1,4 @@
-"""OpenAI 协议处理 - /v1/chat/completions"""
+"""OpenAI protocol handler - /v1/chat/completions."""
 import json
 import uuid
 import time
@@ -15,7 +15,7 @@ from ..core.history_manager import HistoryManager, get_history_config, is_conten
 from ..core.error_handler import classify_error, ErrorType, format_error_log
 from ..core.rate_limiter import get_rate_limiter
 from ..core.auth_guard import ensure_profile_arn_ready
-from ..http_client import get_httpx_verify_setting
+from ..http_client import get_httpx_verify_setting, create_async_client
 from ..kiro_api import (
     build_headers,
     build_kiro_request,
@@ -29,6 +29,10 @@ from ..converters import (
     convert_kiro_response_to_openai,
     extract_images_from_content,
 )
+from ..payload_guards import guard_payload
+from ..logger import get_logger
+
+logger = get_logger("openai")
 
 
 async def handle_chat_completions(request: Request):
@@ -141,6 +145,12 @@ async def handle_chat_completions(request: Request):
         tool_results=tool_results if tool_results else None,
         credentials=creds
     )
+    
+    # Payload size guard
+    payload_error = guard_payload(kiro_request)
+    if payload_error:
+        logger.warning(f"Payload guard: {payload_error}")
+        raise HTTPException(400, payload_error)
     
     error_msg = None
     status_code = 200

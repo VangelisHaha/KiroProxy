@@ -1,4 +1,4 @@
-"""Kiro API Proxy - 主应用"""
+"""Kiro API Proxy - Main application."""
 import json
 import uuid
 import httpx
@@ -13,9 +13,13 @@ from .config import MODELS_URL
 from .core import state, scheduler, stats_manager
 from .handlers import anthropic, openai, gemini, admin
 from .handlers import responses as responses_handler
-from .http_client import get_httpx_verify_setting
+from .http_client import get_httpx_verify_setting, create_async_client
 from .web import get_html_page
 from .credential import generate_machine_id, get_kiro_version
+from .model_resolver import get_model_cache, FALLBACK_MODELS
+from .logger import get_logger
+
+logger = get_logger("main")
 
 
 def get_resource_path(relative_path: str) -> Path:
@@ -66,7 +70,8 @@ async def serve_assets(path: str):
 
 @app.get("/v1/models")
 async def models():
-    """获取可用模型列表"""
+    """List available models with dynamic cache update."""
+    model_cache = get_model_cache()
     try:
         account = state.get_available_account()
         if not account:
@@ -82,10 +87,14 @@ async def models():
             "amz-sdk-invocation-id": str(uuid.uuid4()),
             "Authorization": f"Bearer {token}",
         }
-        async with httpx.AsyncClient(verify=get_httpx_verify_setting(), timeout=30) as client:
+        async with create_async_client(timeout=30) as client:
             resp = await client.get(MODELS_URL, headers=headers, params={"origin": "AI_EDITOR"})
             if resp.status_code == 200:
                 data = resp.json()
+                models_data = data.get("models", [])
+                # Update dynamic model cache
+                model_cache.update(models_data)
+                logger.info(f"Model cache refreshed: {len(models_data)} models")
                 return {
                     "object": "list",
                     "data": [
@@ -93,21 +102,34 @@ async def models():
                             "id": m["modelId"],
                             "object": "model",
                             "owned_by": "kiro",
-                            "name": m["modelName"],
+                            "name": m.get("modelName", m["modelId"]),
                         }
-                        for m in data.get("models", [])
+                        for m in models_data
                     ]
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to fetch models from API: {e}")
     
-    # 降级返回静态列表
+    # Fallback: use cached models or static list
+    cached_models = model_cache.list_all()
+    if cached_models:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": m["modelId"],
+                    "object": "model",
+                    "owned_by": "kiro",
+                    "name": m.get("modelName", m["modelId"]),
+                }
+                for m in cached_models
+            ]
+        }
+    
+    # Last resort: static fallback list
     return {"object": "list", "data": [
-        {"id": "auto", "object": "model", "owned_by": "kiro", "name": "Auto"},
-        {"id": "claude-sonnet-4.5", "object": "model", "owned_by": "kiro", "name": "Claude Sonnet 4.5"},
-        {"id": "claude-sonnet-4", "object": "model", "owned_by": "kiro", "name": "Claude Sonnet 4"},
-        {"id": "claude-haiku-4.5", "object": "model", "owned_by": "kiro", "name": "Claude Haiku 4.5"},
-        {"id": "claude-opus-4.5", "object": "model", "owned_by": "kiro", "name": "Claude Opus 4.5"},
+        {"id": m["modelId"], "object": "model", "owned_by": "kiro", "name": m["modelId"]}
+        for m in FALLBACK_MODELS
     ]}
 
 
