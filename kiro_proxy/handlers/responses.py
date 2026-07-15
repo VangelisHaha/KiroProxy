@@ -481,16 +481,12 @@ def _convert_tools_to_kiro(tools: list) -> list:
     if not tools:
         return None
     
-    MAX_TOOLS = 50  # Kiro API 工具数量限制
     MAX_DESCRIPTION_LENGTH = 9216
     kiro_tools = []
-    function_count = 0
 
     def add_tool_spec(name: str, description: str, parameters: dict):
-        nonlocal function_count
-        if function_count >= MAX_TOOLS or not name:
+        if not name:
             return
-        function_count += 1
         kiro_tools.append({
                 "toolSpecification": {
                     "name": name,
@@ -559,10 +555,6 @@ def _convert_tools_to_kiro(tools: list) -> list:
                     "required": ["prompt"]
                 }
             )
-            continue
-        
-        # 限制工具数量
-        if function_count >= MAX_TOOLS:
             continue
         
         # Responses API 格式：字段直接在工具对象上

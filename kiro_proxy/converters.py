@@ -1,7 +1,7 @@
 """协议转换模块 - Anthropic/OpenAI/Gemini <-> Kiro
 
 增强版：参考 proxycast 实现
-- 工具数量限制（最多 50 个）
+- 完整保留客户端提供的工具定义
 - 工具描述截断（提升至 9216 字符，兼容 Claude Code/Codex 长描述）
 - 历史消息交替修复
 - OpenAI tool 角色消息处理
@@ -16,7 +16,6 @@ from collections import deque
 from typing import List, Dict, Any, Tuple, Optional
 
 # 常量
-MAX_TOOLS = 50
 MAX_TOOL_DESCRIPTION_LENGTH = 9216
 THINKING_MIN_BUDGET = 1024
 THINKING_MAX_BUDGET = 24576
@@ -152,13 +151,11 @@ def convert_anthropic_tools_to_kiro(tools: List[dict]) -> List[dict]:
     """将 Anthropic 工具格式转换为 Kiro 格式
     
     增强：
-    - 限制最多 50 个工具
+    - 完整保留工具定义
     - 截断过长的描述
     - 支持 web_search 特殊工具
     """
     kiro_tools = []
-    function_count = 0
-    
     for tool in tools:
         name = tool.get("name", "")
         
@@ -170,11 +167,6 @@ def convert_anthropic_tools_to_kiro(tools: List[dict]) -> List[dict]:
                 }
             })
             continue
-        
-        # 限制工具数量
-        if function_count >= MAX_TOOLS:
-            continue
-        function_count += 1
         
         description = tool.get("description", f"Tool: {name}")
         description = truncate_description(description)
@@ -493,7 +485,6 @@ def is_tool_choice_required(tool_choice) -> bool:
 def convert_openai_tools_to_kiro(tools: List[dict]) -> List[dict]:
     """将 OpenAI 工具格式转换为 Kiro 格式"""
     kiro_tools = []
-    function_count = 0
     
     for tool in tools:
         tool_type = tool.get("type", "function")
@@ -509,11 +500,6 @@ def convert_openai_tools_to_kiro(tools: List[dict]) -> List[dict]:
         
         if tool_type != "function":
             continue
-        
-        # 限制工具数量
-        if function_count >= MAX_TOOLS:
-            continue
-        function_count += 1
         
         func = tool.get("function", {})
         name = func.get("name", "")
@@ -781,7 +767,6 @@ def convert_gemini_tools_to_kiro(tools: List[dict]) -> List[dict]:
     }
     """
     kiro_tools = []
-    function_count = 0
     
     for tool in tools:
         if not isinstance(tool, dict):
@@ -803,15 +788,10 @@ def convert_gemini_tools_to_kiro(tools: List[dict]) -> List[dict]:
             if not isinstance(func, dict):
                 continue
             
-            # 限制工具数量
-            if function_count >= MAX_TOOLS:
-                break
-            
             name = func.get("name", "")
             if not name:
                 continue
-            
-            function_count += 1
+
             description = func.get("description", f"Tool: {name}")
             description = truncate_description(description)
             parameters = func.get("parameters", {"type": "object", "properties": {}})

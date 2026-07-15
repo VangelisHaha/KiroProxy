@@ -23,8 +23,8 @@ Kiro Proxy 支持三种主流 AI API 协议，可以适配不同的客户端：
 - `tools` 定义和 `tool_result` 响应完整支持
 - `tool_choice: required` 支持（通过 prompt 注入）
 - `web_search` 特殊工具自动识别
-- 工具数量限制（最多 50 个）
-- 描述截断（超过 500 字符自动截断）
+- 完整透传客户端提供的工具定义，不再由代理层截断数量
+- 描述截断（超过 9216 字符自动截断）
 
 ### OpenAI 协议（Codex CLI）
 
@@ -32,7 +32,7 @@ Kiro Proxy 支持三种主流 AI API 协议，可以适配不同的客户端：
 - `tool_calls` 响应处理
 - `tool` 角色消息转换
 - `tool_choice: required/any` 支持
-- 工具数量限制和描述截断
+- 完整透传工具定义，仅对超长描述做截断
 
 ### Gemini 协议
 
@@ -40,7 +40,7 @@ Kiro Proxy 支持三种主流 AI API 协议，可以适配不同的客户端：
 - `functionCall` 响应处理
 - `functionResponse` 工具结果
 - `toolConfig.functionCallingConfig.mode` 支持（ANY/REQUIRED）
-- 工具数量限制和描述截断
+- 完整透传工具定义，仅对超长描述做截断
 
 ### 历史消息修复
 
