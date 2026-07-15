@@ -6,9 +6,21 @@ from kiro_proxy.converters import (
     convert_gemini_contents_to_kiro,
     convert_openai_messages_to_kiro,
 )
+from kiro_proxy.thinking_parser import ThinkingParser
 
 
 class ThinkingCompatTests(unittest.TestCase):
+    def test_parser_streams_thinking_and_handles_split_tags(self):
+        parser = ThinkingParser(handling_mode="as_reasoning_content")
+        chunks = ["<thin", "king>分析第一步", "，继续分析</think", "ing>最终答案"]
+        results = [parser.process(chunk) for chunk in chunks]
+        results.append(parser.flush())
+
+        thinking = "".join(result.thinking_content or "" for result in results)
+        regular = "".join(result.regular_content or "" for result in results)
+        self.assertEqual(thinking, "分析第一步，继续分析")
+        self.assertEqual(regular, "最终答案")
+
     def test_build_thinking_prefix_enabled_clamps_budget(self):
         prefix = build_thinking_prefix({"type": "enabled", "budget_tokens": 1})
         self.assertIn("<thinking_mode>enabled</thinking_mode>", prefix)

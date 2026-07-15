@@ -27,6 +27,7 @@ from ..converters import (
 from ..payload_guards import guard_payload
 from ..tokenizer import count_tokens, count_message_tokens
 from ..logger import get_logger
+from ..thinking_parser import ThinkingParser
 
 logger = get_logger("anthropic")
 
@@ -358,9 +359,43 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                         # 正常处理响应
                         msg_id = f"msg_{log_id}"
                         yield f'data: {{"type":"message_start","message":{{"id":"{msg_id}","type":"message","role":"assistant","content":[],"model":"{model}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}\n\n'
-                        yield f'data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}\n\n'
 
                         full_response = b""
+                        thinking_parser = ThinkingParser()
+                        active_block_type = None
+                        active_block_index = -1
+                        next_block_index = 0
+
+                        def stream_content(block_type, content):
+                            nonlocal active_block_type, active_block_index, next_block_index
+                            if not content:
+                                return []
+                            events = []
+                            if active_block_type != block_type:
+                                if active_block_type is not None:
+                                    events.append({"type": "content_block_stop", "index": active_block_index})
+                                active_block_type = block_type
+                                active_block_index = next_block_index
+                                next_block_index += 1
+                                content_block = {"type": block_type, block_type: ""}
+                                events.append({
+                                    "type": "content_block_start",
+                                    "index": active_block_index,
+                                    "content_block": content_block,
+                                })
+                            delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
+                            events.append({
+                                "type": "content_block_delta",
+                                "index": active_block_index,
+                                "delta": {"type": delta_type, block_type: content},
+                            })
+                            return events
+
+                        def encode_events(events):
+                            return [
+                                f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                                for event in events
+                            ]
 
                         async for chunk in response.aiter_bytes():
                             full_response += chunk
@@ -389,7 +424,11 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                                 full_content += content
                                                 if flow_id:
                                                     flow_monitor.add_chunk(flow_id, content)
-                                                yield f'data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(content)}}}}}\n\n'
+                                                parsed = thinking_parser.process(content)
+                                                for event in encode_events(stream_content("thinking", parsed.thinking_content)):
+                                                    yield event
+                                                for event in encode_events(stream_content("text", parsed.regular_content)):
+                                                    yield event
                                         except Exception:
                                             pass
                                     pos += total_len
@@ -397,11 +436,18 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                                 pass
 
                         result = parse_event_stream_full(full_response)
+                        remaining = thinking_parser.flush()
+                        for event in encode_events(stream_content("thinking", remaining.thinking_content)):
+                            yield event
+                        for event in encode_events(stream_content("text", remaining.regular_content)):
+                            yield event
 
-                        yield f'data: {{"type":"content_block_stop","index":0}}\n\n'
+                        if active_block_type is not None:
+                            yield f'data: {{"type":"content_block_stop","index":{active_block_index}}}\n\n'
+                            active_block_type = None
 
                         if result["tool_uses"]:
-                            for i, tool_use in enumerate(result["tool_uses"], 1):
+                            for i, tool_use in enumerate(result["tool_uses"], next_block_index):
                                 yield f'data: {{"type":"content_block_start","index":{i},"content_block":{{"type":"tool_use","id":"{tool_use["id"]}","name":"{tool_use["name"]}","input":{{}}}}}}\n\n'
                                 yield f'data: {{"type":"content_block_delta","index":{i},"delta":{{"type":"input_json_delta","partial_json":{json.dumps(json.dumps(tool_use["input"]))}}}}}\n\n'
                                 yield f'data: {{"type":"content_block_stop","index":{i}}}\n\n'

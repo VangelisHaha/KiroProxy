@@ -214,6 +214,30 @@ class ProtocolE2ERegressionTests(unittest.TestCase):
         self.assertTrue(user_input["content"].startswith("x-anthropic-billing-header:"))
         self.assertEqual(len(user_input["userInputMessageContext"]["tools"]), 2)
 
+    def test_anthropic_stream_returns_native_thinking_blocks(self):
+        fixture = _load_fixture("anthropic_claude_code_stream.json")
+        fixture["request"]["thinking"] = {"type": "enabled", "budget_tokens": 2048}
+        stream_chunks = [
+            _aws_event_chunk(
+                {"assistantResponseEvent": {"content": content}},
+                "assistantResponseEvent",
+            )
+            for content in ("<thin", "king>分析第一步", "，继续分析</thinking>\n\n最终答案")
+        ]
+        upstream = _UpstreamStub(stream_response=_FakeHTTPResponse(status_code=200, chunks=stream_chunks))
+        account = _DummyAccount()
+
+        with self._patch_runtime(upstream, account):
+            with TestClient(app) as client:
+                resp = client.post("/v1/messages", json=fixture["request"])
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('"content_block":{"type":"thinking","thinking":""}', resp.text)
+        self.assertIn('"type":"thinking_delta"', resp.text)
+        self.assertIn('"type":"text_delta"', resp.text)
+        self.assertNotIn("<thinking>", resp.text)
+        self.assertNotIn("</thinking>", resp.text)
+
     def test_codex_responses_stream_fixture_regression(self):
         fixture = _load_fixture("responses_codex_stream.json")
         stream_chunks = [

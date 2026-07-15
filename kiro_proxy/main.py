@@ -18,6 +18,7 @@ from .web import get_html_page
 from .credential import generate_machine_id, get_kiro_version
 from .model_resolver import get_model_cache, FALLBACK_MODELS
 from .logger import get_logger
+from .env_config import SERVER_HOST
 
 logger = get_logger("main")
 
@@ -582,7 +583,7 @@ def run(port: int = 8080):
     print(f"  Kiro API Proxy v1.7.16")
     print(f"  http://localhost:{port}")
     print(f"{'='*50}\n")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host=SERVER_HOST, port=port)
 
 
 if __name__ == "__main__":

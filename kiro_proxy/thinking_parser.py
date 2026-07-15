@@ -117,7 +117,7 @@ class ThinkingParser:
                 after_tag = stripped[len(tag):]
                 self.thinking_buffer = after_tag
                 self.buffer = ""
-                return ThinkingResult()
+                return self._handle_in_thinking("")
 
         # No tag found, switch to streaming
         self.state = ParserState.STREAMING
@@ -137,10 +137,22 @@ class ThinkingParser:
         # Check for closing tag
         close_pos = self.thinking_buffer.find(close_tag)
         if close_pos == -1:
-            # Check if buffer ends with partial closing tag
+            if self.handling_mode == "pass":
+                return ThinkingResult()
+            # 只保留可能属于结束标签的尾部，其他内容可立即流式输出。
+            partial_length = 0
             for i in range(1, len(close_tag)):
                 if self.thinking_buffer.endswith(close_tag[:i]):
-                    return ThinkingResult()  # Keep buffering
+                    partial_length = i
+            safe_length = len(self.thinking_buffer) - partial_length
+            safe_content = self.thinking_buffer[:safe_length]
+            self.thinking_buffer = self.thinking_buffer[safe_length:]
+            if self.handling_mode == "as_reasoning_content":
+                return ThinkingResult(thinking_content=safe_content or None)
+            if self.handling_mode == "remove":
+                return ThinkingResult()
+            if self.handling_mode == "strip_tags":
+                return ThinkingResult(regular_content=safe_content or None)
             return ThinkingResult()
 
         # Found closing tag
