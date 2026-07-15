@@ -25,6 +25,8 @@ class ThinkingCompatTests(unittest.TestCase):
         prefix = build_thinking_prefix({"type": "enabled", "budget_tokens": 1})
         self.assertIn("<thinking_mode>enabled</thinking_mode>", prefix)
         self.assertIn("<max_thinking_length>1024</max_thinking_length>", prefix)
+        self.assertIn("<thinking_summary_instruction>", prefix)
+        self.assertIn("inside <thinking> and </thinking>", prefix)
 
     def test_anthropic_converter_injects_thinking_prefix(self):
         user_content, _, _ = convert_anthropic_messages_to_kiro(
@@ -34,6 +36,7 @@ class ThinkingCompatTests(unittest.TestCase):
         )
         self.assertIn("<thinking_mode>enabled</thinking_mode>", user_content)
         self.assertIn("<max_thinking_length>1234</max_thinking_length>", user_content)
+        self.assertIn("<thinking_summary_reminder>", user_content)
 
     def test_openai_converter_injects_thinking_prefix(self):
         user_content, _, _, _ = convert_openai_messages_to_kiro(
@@ -48,6 +51,7 @@ class ThinkingCompatTests(unittest.TestCase):
         )
         self.assertIn("<thinking_mode>adaptive</thinking_mode>", user_content)
         self.assertIn("<thinking_effort>high</thinking_effort>", user_content)
+        self.assertIn("<thinking_summary_instruction>", user_content)
 
     def test_gemini_converter_maps_thinking_config_to_prefix(self):
         user_content, history, tool_results, _, _ = convert_gemini_contents_to_kiro(

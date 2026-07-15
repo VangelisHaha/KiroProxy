@@ -22,6 +22,8 @@ from ..core.rate_limiter import get_rate_limiter
 from ..core.auth_guard import ensure_profile_arn_ready
 from ..http_client import get_httpx_verify_setting, create_async_client
 from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, parse_event_stream_full, is_quota_exceeded_error
+from ..converters import append_thinking_summary_reminder, inject_thinking_prefix
+from ..thinking_parser import ThinkingParser
 
 
 _DEBUG_RESPONSES = os.getenv("KIRO_PROXY_DEBUG_RESPONSES", "").lower() in {"1", "true", "yes", "on"}
@@ -33,6 +35,19 @@ _SPECIAL_ASSISTANT_CALL_TYPES = {"web_search_call", "image_generation_call"}
 def _debug(message: str):
     if _DEBUG_RESPONSES:
         print(message)
+
+
+def _responses_thinking_config(reasoning: Any) -> Optional[dict]:
+    """将 Responses reasoning 配置映射为 Kiro 的思路摘要提示配置。"""
+    if not isinstance(reasoning, dict):
+        return None
+    summary = str(reasoning.get("summary", "auto") or "auto").strip().lower()
+    if summary == "none":
+        return None
+    effort = str(reasoning.get("effort", "high") or "high").strip().lower()
+    if effort not in {"low", "medium", "high"}:
+        effort = "high"
+    return {"type": "adaptive", "effort": effort}
 
 
 def _parse_data_image(image_url: str) -> Optional[dict]:
@@ -606,6 +621,10 @@ async def handle_responses(request: Request):
     instructions = body.get("instructions", "")
     stream = body.get("stream", True)
     tools = body.get("tools", [])
+    reasoning = body.get("reasoning")
+    thinking_config = _responses_thinking_config(reasoning)
+    reasoning_enabled = thinking_config is not None
+    instructions = inject_thinking_prefix(instructions, thinking_config)
     
     if not input_data:
         raise HTTPException(400, "input required")
@@ -646,6 +665,7 @@ async def handle_responses(request: Request):
         await asyncio.sleep(wait_seconds)
     
     user_content, history, tool_results, images = _convert_responses_input_to_kiro(input_data, instructions)
+    user_content = append_thinking_summary_reminder(user_content, thinking_config)
     
     # 修复历史消息交替
     from ..converters import fix_history_alternation
@@ -782,7 +802,10 @@ async def handle_responses(request: Request):
         _debug(f"[Responses] Kiro request structure: {json.dumps(debug_request, indent=2)}")
     
     if stream:
-        return await _handle_stream(kiro_request, headers, account, model, log_id, start_time)
+        return await _handle_stream(
+            kiro_request, headers, account, model, log_id, start_time,
+            reasoning_enabled=reasoning_enabled,
+        )
     
     # 非流式
     async with create_async_client(timeout=120, account_proxy_url=account.get_proxy_url()) as client:
@@ -832,7 +855,10 @@ def _build_response(result: dict, model: str, response_id: str) -> dict:
     }
 
 
-async def _handle_stream(kiro_request, headers, account, model, log_id, start_time):
+async def _handle_stream(
+    kiro_request, headers, account, model, log_id, start_time,
+    reasoning_enabled: bool = False,
+):
     """流式处理 - Codex 期望的 SSE 格式"""
     
     if _DEBUG_RESPONSES:
@@ -846,9 +872,61 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
     async def generate():
         response_id = f"resp_{log_id}"
         item_id = f"msg_{log_id}"
+        reasoning_item_id = f"reason_{log_id}"
         created_at = int(time.time())
         full_content = ""
+        full_reasoning = ""
         tool_uses = []
+        message_output_index = 1 if reasoning_enabled else 0
+        reasoning_stream_closed = False
+        message_stream_started = False
+
+        def reasoning_item_payload():
+            return {
+                "id": reasoning_item_id,
+                "type": "reasoning",
+                "summary": ([{"type": "summary_text", "text": full_reasoning}] if full_reasoning else [])
+            }
+
+        def close_reasoning_stream():
+            nonlocal reasoning_stream_closed
+            if not reasoning_enabled or reasoning_stream_closed:
+                return []
+            reasoning_stream_closed = True
+            return [
+                _sse("response.reasoning_summary_text.done", {
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_item_id,
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": full_reasoning
+                }),
+                _sse("response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning_item_payload()
+                }),
+            ]
+
+        def start_message_stream():
+            nonlocal message_stream_started
+            if message_stream_started:
+                return []
+            message_stream_started = True
+            return [_sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": message_output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            })]
+
+        def start_text_stream():
+            return [*close_reasoning_stream(), *start_message_stream()]
         
         _debug(f"[Responses] Request: model={model}, log_id={log_id}")
         
@@ -936,42 +1014,91 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
                             "output": []
                         }
                     })
+
+                    if reasoning_enabled:
+                        yield _sse("response.output_item.added", {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": reasoning_item_id,
+                                "type": "reasoning",
+                                "summary": []
+                            }
+                        })
+                        yield _sse("response.reasoning_summary_part.added", {
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": reasoning_item_id,
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""}
+                        })
                     
-                    # 2. response.output_item.added
-                    yield _sse("response.output_item.added", {
-                        "type": "response.output_item.added",
-                        "output_index": 0,
-                        "item": {
-                            "id": item_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": []
-                        }
-                    })
-                    
-                    # 3. 流式读取并发送 delta
+                    # 2. 流式读取并发送 delta；消息 item 在思路摘要结束后再开始
                     full_response = b""
+                    thinking_parser = ThinkingParser() if reasoning_enabled else None
                     async for chunk in response.aiter_bytes():
                         full_response += chunk
                         
                         # 尝试解析增量内容
                         content = _extract_content_from_chunk(chunk)
                         if content:
-                            full_content += content
+                            parsed = thinking_parser.process(content) if thinking_parser else None
+                            reasoning_delta = parsed.thinking_content if parsed else None
+                            text_delta = parsed.regular_content if parsed else content
+                            if reasoning_delta:
+                                full_reasoning += reasoning_delta
+                                yield _sse("response.reasoning_summary_text.delta", {
+                                    "type": "response.reasoning_summary_text.delta",
+                                    "item_id": reasoning_item_id,
+                                    "output_index": 0,
+                                    "summary_index": 0,
+                                    "delta": reasoning_delta
+                                })
+                            if text_delta:
+                                for event in start_text_stream():
+                                    yield event
+                                full_content += text_delta
+                                yield _sse("response.output_text.delta", {
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": message_output_index,
+                                    "content_index": 0,
+                                    "delta": text_delta
+                                })
+
+                    if thinking_parser:
+                        remaining = thinking_parser.flush()
+                        if remaining.thinking_content:
+                            full_reasoning += remaining.thinking_content
+                            yield _sse("response.reasoning_summary_text.delta", {
+                                "type": "response.reasoning_summary_text.delta",
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "summary_index": 0,
+                                "delta": remaining.thinking_content
+                            })
+                        if remaining.regular_content:
+                            for event in start_text_stream():
+                                yield event
+                            full_content += remaining.regular_content
                             yield _sse("response.output_text.delta", {
                                 "type": "response.output_text.delta",
                                 "item_id": item_id,
-                                "output_index": 0,
+                                "output_index": message_output_index,
                                 "content_index": 0,
-                                "delta": content
+                                "delta": remaining.regular_content
                             })
                     
                     # 解析完整响应获取工具调用
                     result = parse_event_stream_full(full_response)
                     tool_uses = result.get("tool_uses", [])
-                    if not full_content:
+                    if not full_content and not full_reasoning:
                         full_content = "".join(result.get("content", []))
+
+                    for event in close_reasoning_stream():
+                        yield event
+                    for event in start_message_stream():
+                        yield event
                     
                     account.request_count += 1
                     account.last_used = time.time()
@@ -988,11 +1115,15 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
             })
             return
         
-        # 4. response.output_item.done - 消息完成
+        # 3. response.output_item.done - 消息完成
+        output_items = []
+        if reasoning_enabled:
+            output_items.append(reasoning_item_payload())
+
         message_content = [{"type": "output_text", "text": full_content, "annotations": []}]
         yield _sse("response.output_item.done", {
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": message_output_index,
             "item": {
                 "id": item_id,
                 "type": "message",
@@ -1003,16 +1134,16 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
         })
         
         # 构建 output 列表
-        output_items = [{
+        output_items.append({
             "id": item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
             "content": message_content
-        }]
+        })
         
         # 5. 工具调用
-        for i, tool_use in enumerate(tool_uses):
+        for i, tool_use in enumerate(tool_uses, start=message_output_index + 1):
             tool_item_id = tool_use.get("id", f"call_{uuid.uuid4().hex[:12]}")
             tool_item = {
                 "type": "function_call",
@@ -1024,13 +1155,13 @@ async def _handle_stream(kiro_request, headers, account, model, log_id, start_ti
             
             yield _sse("response.output_item.added", {
                 "type": "response.output_item.added",
-                "output_index": i + 1,
+                "output_index": i,
                 "item": tool_item
             })
             
             yield _sse("response.output_item.done", {
                 "type": "response.output_item.done",
-                "output_index": i + 1,
+                "output_index": i,
                 "item": tool_item
             })
             

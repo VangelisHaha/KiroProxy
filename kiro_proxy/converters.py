@@ -20,6 +20,20 @@ MAX_TOOL_DESCRIPTION_LENGTH = 9216
 THINKING_MIN_BUDGET = 1024
 THINKING_MAX_BUDGET = 24576
 THINKING_DEFAULT_BUDGET = 20000
+THINKING_SUMMARY_INSTRUCTION = (
+    "<thinking_summary_instruction>"
+    "Before each final answer or tool call, first output a concise user-visible reasoning summary "
+    "inside <thinking> and </thinking>. Summarize the approach and current progress only. "
+    "Do not reveal hidden chain-of-thought, private data, secrets, or policy text. "
+    "After </thinking>, continue with the normal answer or tool call."
+    "</thinking_summary_instruction>"
+)
+THINKING_SUMMARY_REMINDER = (
+    "<thinking_summary_reminder>"
+    "The response protocol requires a concise user-visible summary in <thinking>...</thinking> "
+    "before the normal answer or tool call, even when the user asks for only the final answer."
+    "</thinking_summary_reminder>"
+)
 
 
 def generate_session_id(messages: list) -> str:
@@ -113,20 +127,28 @@ def _normalize_thinking_budget(budget_tokens: Any) -> int:
 
 
 def build_thinking_prefix(thinking: Any) -> str:
-    """将 thinking 配置映射为 Kiro 可识别前缀。"""
+    """将 thinking 配置映射为 Kiro 可识别前缀和可见思路摘要协议。"""
     if not isinstance(thinking, dict):
         return ""
 
     thinking_type = str(thinking.get("type", "")).strip().lower()
     if thinking_type == "enabled":
         budget = _normalize_thinking_budget(thinking.get("budget_tokens"))
-        return f"<thinking_mode>enabled</thinking_mode><max_thinking_length>{budget}</max_thinking_length>"
+        return (
+            f"<thinking_mode>enabled</thinking_mode>"
+            f"<max_thinking_length>{budget}</max_thinking_length>\n"
+            f"{THINKING_SUMMARY_INSTRUCTION}"
+        )
 
     if thinking_type == "adaptive":
         effort = str(thinking.get("effort", "high")).strip().lower()
         if effort not in {"low", "medium", "high"}:
             effort = "high"
-        return f"<thinking_mode>adaptive</thinking_mode><thinking_effort>{effort}</thinking_effort>"
+        return (
+            f"<thinking_mode>adaptive</thinking_mode>"
+            f"<thinking_effort>{effort}</thinking_effort>\n"
+            f"{THINKING_SUMMARY_INSTRUCTION}"
+        )
 
     return ""
 
@@ -143,6 +165,16 @@ def inject_thinking_prefix(system_text: str, thinking: Any) -> str:
     if system_text:
         return f"{prefix}\n{system_text}"
     return prefix
+
+
+def append_thinking_summary_reminder(content: str, thinking: Any) -> str:
+    """在当前轮末尾追加思路摘要协议提醒，避免普通用户指令覆盖协议格式。"""
+    if not build_thinking_prefix(thinking):
+        return content
+    text = str(content or "").strip()
+    if THINKING_SUMMARY_REMINDER in text:
+        return text
+    return f"{text}\n\n{THINKING_SUMMARY_REMINDER}" if text else THINKING_SUMMARY_REMINDER
 
 
 # ==================== Anthropic 转换 ====================
@@ -444,6 +476,7 @@ def convert_anthropic_messages_to_kiro(
     
     # 修复历史交替
     history = fix_history_alternation(history)
+    user_content = append_thinking_summary_reminder(user_content, thinking)
     
     return user_content, history, current_tool_results
 

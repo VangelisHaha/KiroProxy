@@ -88,6 +88,7 @@ It can serve as a unified integration layer for tools such as Claude Code, Codex
 - **Remote login links** - Complete authorization on a browser-enabled machine and sync tokens automatically
 - **Account import/export** - Migrate account configurations across machines
 - **Manual token input** - Paste accessToken / refreshToken directly
+- **Streaming reasoning summaries** - Anthropic `thinking` and OpenAI Responses `reasoning.summary` are converted into user-visible summary events without exposing hidden chain-of-thought
 
 ### What's New in v1.6.2
 - **Full Codex CLI support** - Uses the OpenAI Responses API (`/v1/responses`)

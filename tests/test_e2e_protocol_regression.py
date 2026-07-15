@@ -310,6 +310,40 @@ class ProtocolE2ERegressionTests(unittest.TestCase):
                 tool_use_ids.add(tool_use.get("toolUseId"))
         self.assertTrue({"fc_1", "sh_1", "ts_1"}.issubset(tool_use_ids))
 
+    def test_codex_responses_stream_returns_reasoning_summary(self):
+        fixture = _load_fixture("responses_codex_stream.json")
+        fixture["request"]["reasoning"] = {"effort": "high", "summary": "detailed"}
+        stream_chunks = [
+            _aws_event_chunk(
+                {"assistantResponseEvent": {"content": content}},
+                "assistantResponseEvent",
+            )
+            for content in ("<thin", "king>检查配置与运行态", "</thinking>最终结论")
+        ]
+        upstream = _UpstreamStub(stream_response=_FakeHTTPResponse(status_code=200, chunks=stream_chunks))
+        account = _DummyAccount()
+
+        with self._patch_runtime(upstream, account):
+            with TestClient(app) as client:
+                resp = client.post("/v1/responses", json=fixture["request"])
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("event: response.reasoning_summary_part.added", resp.text)
+        self.assertIn("event: response.reasoning_summary_text.delta", resp.text)
+        self.assertIn("event: response.reasoning_summary_text.done", resp.text)
+        self.assertIn('"type": "reasoning"', resp.text)
+        self.assertIn("检查配置与运行态", resp.text)
+        self.assertIn("最终结论", resp.text)
+        self.assertNotIn("<thinking>", resp.text)
+        self.assertNotIn("</thinking>", resp.text)
+
+        payload = upstream.stream_requests[0]["json"]
+        user_input = payload["conversationState"]["currentMessage"]["userInputMessage"]
+        self.assertIn("<thinking_mode>adaptive</thinking_mode>", user_input["content"])
+        self.assertIn("<thinking_effort>high</thinking_effort>", user_input["content"])
+        self.assertIn("<thinking_summary_instruction>", user_input["content"])
+        self.assertIn("<thinking_summary_reminder>", user_input["content"])
+
     def test_gemini_generate_content_fixture_regression(self):
         fixture = _load_fixture("gemini_cli_generate_content.json")
         post_content = b"".join(
