@@ -1,5 +1,6 @@
 """设备指纹生成"""
 import hashlib
+import os
 import platform
 import subprocess
 from pathlib import Path
@@ -66,6 +67,9 @@ def generate_machine_id(
 
 def get_kiro_version() -> str:
     """获取 Kiro IDE 版本号"""
+    configured_version = os.getenv("KIRO_CLIENT_VERSION", "").strip()
+    if configured_version:
+        return configured_version
     if platform.system() == "Darwin":
         kiro_paths = [
             "/Applications/Kiro.app/Contents/Info.plist",

@@ -1,9 +1,14 @@
 import unittest
+from unittest.mock import patch
 
-from kiro_proxy.credential.fingerprint import generate_machine_id
+from kiro_proxy.credential.fingerprint import generate_machine_id, get_kiro_version
 
 
 class MachineIdStabilityTests(unittest.TestCase):
+    def test_kiro_version_supports_environment_override(self):
+        with patch.dict("os.environ", {"KIRO_CLIENT_VERSION": "1.0.138"}):
+            self.assertEqual(get_kiro_version(), "1.0.138")
+
     def test_machine_id_is_stable_for_same_inputs(self):
         m1 = generate_machine_id(
             profile_arn="arn:aws:codewhisperer:us-east-1:123456789012:profile/test",

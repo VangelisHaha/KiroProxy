@@ -16,7 +16,7 @@ from .handlers import responses as responses_handler
 from .http_client import get_httpx_verify_setting, create_async_client
 from .web import get_html_page
 from .credential import generate_machine_id, get_kiro_version
-from .model_resolver import get_model_cache, FALLBACK_MODELS
+from .model_resolver import get_model_cache, merge_advertised_models, FALLBACK_MODELS
 from .logger import get_logger
 from .env_config import SERVER_HOST
 
@@ -92,7 +92,7 @@ async def models():
             resp = await client.get(MODELS_URL, headers=headers, params={"origin": "AI_EDITOR"})
             if resp.status_code == 200:
                 data = resp.json()
-                models_data = data.get("models", [])
+                models_data = merge_advertised_models(data.get("models", []))
                 # Update dynamic model cache
                 model_cache.update(models_data)
                 logger.info(f"Model cache refreshed: {len(models_data)} models")
@@ -112,7 +112,7 @@ async def models():
         logger.warning(f"Failed to fetch models from API: {e}")
     
     # Fallback: use cached models or static list
-    cached_models = model_cache.list_all()
+    cached_models = merge_advertised_models(model_cache.list_all())
     if cached_models:
         return {
             "object": "list",
@@ -130,7 +130,7 @@ async def models():
     # Last resort: static fallback list
     return {"object": "list", "data": [
         {"id": m["modelId"], "object": "model", "owned_by": "kiro", "name": m["modelId"]}
-        for m in FALLBACK_MODELS
+        for m in merge_advertised_models(FALLBACK_MODELS)
     ]}
 
 

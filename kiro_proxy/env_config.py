@@ -99,6 +99,11 @@ FIRST_TOKEN_MAX_RETRIES: int = int(os.getenv("KIRO_FIRST_TOKEN_MAX_RETRIES", "3"
 # ==============================================================================
 
 MODEL_CACHE_TTL: int = int(os.getenv("KIRO_MODEL_CACHE_TTL", "3600"))
+EXTRA_MODELS: List[str] = [
+    model.strip()
+    for model in os.getenv("KIRO_EXTRA_MODELS", "").split(",")
+    if model.strip()
+]
 
 # ==============================================================================
 # Logging Settings

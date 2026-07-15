@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from .logger import get_logger
+from .env_config import EXTRA_MODELS
 
 logger = get_logger("model_resolver")
 
@@ -117,6 +118,20 @@ def get_model_cache() -> ModelCache:
     return _model_cache
 
 
+def merge_advertised_models(
+    models_data: List[Dict[str, str]],
+    extra_models: Optional[List[str]] = None,
+) -> List[Dict[str, str]]:
+    """合并模型接口返回值与本机已验证的隐藏模型，并保持顺序去重。"""
+    merged = [dict(model) for model in models_data]
+    known_ids = {model.get("modelId") for model in merged}
+    for model_id in EXTRA_MODELS if extra_models is None else extra_models:
+        if model_id and model_id not in known_ids:
+            merged.append({"modelId": model_id, "modelName": model_id})
+            known_ids.add(model_id)
+    return merged
+
+
 def normalize_model_name(name: str) -> str:
     """Normalize client model name to Kiro format.
 
@@ -204,6 +219,15 @@ def resolve_model(name: str) -> ModelResolution:
         return ModelResolution(
             internal_id=alias_target,
             source="alias",
+            original_request=original,
+            normalized=normalized,
+            is_verified=True,
+        )
+
+    if normalized in EXTRA_MODELS:
+        return ModelResolution(
+            internal_id=normalized,
+            source="hidden",
             original_request=original,
             normalized=normalized,
             is_verified=True,
